@@ -1,0 +1,252 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../Build/Graph/Schema.xsd" >
+
+	<!-- Horde Options -->	
+	<EnvVar Name="UE_HORDE_JOBID"/>
+	<Option Name="Horde" Restrict="true|false" DefaultValue="false" Description="Whether the build is running under Horde"/>
+	<Option Name="PreflightChange" DefaultValue="" Description="Preflight CL number if preflight, empty otherwise"/>
+	<Option Name="SetPreflightFlag" DefaultValue="true" Description="Whether to set the IsPreflight flag to true for preflights. Use with caution: this will cause things like build versions to be set to their non-preflight form."/>
+	<Property Name="IsPreflight" Value="false"/>
+	<Property Name="IsPreflight" Value="true" If="'$(PreflightChange)' != '' And $(SetPreflightFlag)"/>
+	<Property Name="PreflightSuffix" Value=""/>
+	<Property Name="PreflightSuffix" Value="-PF-$(PreflightChange)-$(UE_HORDE_JOBID)" If="$(IsPreflight)"/>
+	<Property Name="BuildName" Value="$(EscapedBranch)-CL-$(Change)$(PreflightSuffix)"/>
+
+	<!-- Projects setup-->
+	<Option Name="ProjectNames" DefaultValue="false" Restrict=".+" Description="The Projects to test"/>
+	<Error Message="No project names specified" If="'$(ProjectNames)' == 'false'"/>
+	<Option Name="UgsProject" DefaultValue="" Description="The relative path to the project"/>
+	<Option Name="UgsBadge" DefaultValue="" Description="The badge name to use with labels"/>
+
+	<!-- Platform Options -->
+	<Option Name="Win64" DefaultValue="false" Description="Enable Win64 Platform"/>
+	<Option Name="MacOS" DefaultValue="false" Description="Enable MacOS Platform"/>
+	<Error Message="No platforms specified" If="!$(Win64) And !$(MacOS)"/>
+
+	<!-- Build Options -->
+	<Property Name="ExtraPluginsCommaDelims" Value="EditorTests"/>
+	<Property Name="ExtraPluginsPlusDelims" Value=""/> <!-- populated programmatically -->
+	<ForEach Name="Plugin" Values="$(ExtraPluginsCommaDelims)">
+		<Property Name="ExtraPluginString" Value="$(Plugin)" If="'$(ExtraPluginsPlusDelims)' == ''"/>
+		<Property Name="ExtraPluginString" Value="$(ExtraPluginsPlusDelims)+$(Plugin)" If="'$(ExtraPluginsPlusDelims)' != ''"/>
+		<Property Name="ExtraPluginsPlusDelims" Value="$(ExtraPluginString)"/>
+	</ForEach>
+	<Property Name="EditorCompileArgs" Value="-BuildPlugin=$(ExtraPluginsPlusDelims)"/>
+
+	<!-- Automation uses its own network output directory -->
+	<Property Name="AutomationNetworkRootDir" Value="//epicgames.net/root/Builds/Automation/Reports/IterationProfile"/>
+	<Property Name="AutomationNetworkRootDir" Value="/Volumes/Builds/Automation/Reports/IterationProfile" If="'$(HostPlatform)' != 'Win64'"/>
+	<Property Name="AutomationReportRootUrl" Value="http://automation.epicgames.net/reports/iterationprofile"/>
+	<Property Name="AutomationLocalOutputDir" Value="$(RootDir)/LocalBuilds/Reports"/>
+
+	<!-- Outputs for this run -->
+	<Property Name="AutomationNetworkOutputDir" Value="$(AutomationNetworkRootDir)/$(BuildName)"/>
+	<Property Name="AutomationReportBaseUrl" Value="$(AutomationReportRootUrl)/$(BuildName)"/>
+	<Property Name="AutomationOutputDir" Value="$(AutomationLocalOutputDir)"/>
+	<Property Name="AutomationOutputDir" Value="$(AutomationNetworkOutputDir)" If="$(IsBuildMachine)"/>
+
+	<!-- Options for baselining -->
+	<Option Name="RunAndBaseline" DefaultValue="false" Description="Enable graph dependencies for running and setting the baseline in a single build."/>
+	<Option Name="BaselineDir" DefaultValue="$(RootDir)/Engine/Build/Baseline" Description="The revision controlled location of the baseline telemetry files."/>
+	<Option Name="BaselineBuildName" DefaultValue="$(BuildName)" Description="The BuildName of the build to set as the new baseline to compare against."/>
+	<Property Name="BaselineAutomationNetworkOutputDir" Value="$(AutomationNetworkRootDir)/$(BaselineBuildName)"/>
+	<Property Name="BaselineAutomationNetworkOutputDir" Value="$(AutomationOutputDir)" If="$(RunAndBaseline)"/>
+
+	<!-- Arguments for tracing -->
+	<Option Name="ColdPass" DefaultValue="true" Description="Perform cold workspace loading profiles"/>
+	<Option Name="ColdArgs" DefaultValue="-ddc=Cold" Description="Arguments to unreal for the cold pass"/>
+	<Option Name="WarmPass" DefaultValue="true" Description="Perform warm (incremental) workspace loading profiles"/>
+	<Option Name="WarmArgs" DefaultValue="-ddc=Warm" Description="Arguments to unreal for the warm pass"/>
+	<Property Name="TraceDir" Value="$(RootDir)/Engine/Programs/UnrealInsights/Saved/TraceSessions"/>
+
+	<!-- Gauntlet arguments for all runs -->
+	<Property Name="GauntletArgs" Value="-build=editor -UseEditor -verbose -report -tempdir=&quot;$(RootDir)/Tests&quot;"/>
+	<Property Name="GauntletArgs" Value="$(GauntletArgs) -branch=$(Branch) -ECBranch=&quot;$(Branch)&quot; -ECChangelist=&quot;$(Change)&quot;"/>
+	<Property Name="GauntletArgs" Value="$(GauntletArgs) -maxduration=14400"/>
+
+	<!-- Gauntlet arguments for profile runs -->
+	<Property Name="ProfileArgs" Value="-test=EditorTests -testfilter=Group:Iteration -tracefiletrunc"/>
+	<Property Name="ProfileArgs" Value="$(ProfileArgs) -EnablePlugins=$(ExtraPluginsCommaDelims)" If="'$(ExtraPluginsCommaDelims)' != ''"/>
+	<Property Name="ProfileArgs" Value="$(ProfileArgs) -TreatLogWarningsAsTestErrors=false -TreatLogErrorsAsTestErrors=false"/>
+	<Property Name="ProfileArgs" Value="$(ProfileArgs) -GameInstanceLostTimerSeconds=3600"/>
+	<Property Name="ProfileArgs" Value="$(ProfileArgs) -NoLoadLevelAtStartup"/>
+	<Property Name="ProfileArgs" Value="$(ProfileArgs) -NoShaderDistrib"/>
+
+	<!-- Gauntlet arguments for summarize commandlet runs -->
+	<Property Name="SummarizeArgs" Value="-statsfile=&quot;$(RootDir)/Engine/Build/IterationProfileStats.csv&quot;"/>
+	<Property Name="SummarizeArgs" Value="$(SummarizeArgs) -skipbaseline" If="$(RunAndBaseline)"/>
+
+	<!-- The main test running macro logic that is expanded with platform and dependency node names -->
+	<Macro Name="RunTest" Arguments="OutputName;PlatformName;ProjectName;NodeName;Phase;Args">
+		<Property Name="TestName" Value="IterationProfile$(Phase)"/>
+		<Property Name="TraceFilePath" Value="$(TraceDir)/$(ProjectName)$(PlatformName)$(TestName).utrace"/>
+		<Property Name="TelemetryFileName" Value="$(ProjectName)$(PlatformName)$(TestName)Telemetry.csv"/>
+		<Property Name="TelemetryFilePath" Value="$(TraceDir)/$(TelemetryFileName)"/>
+		<Property Name="ReportExportPath" Value="$(AutomationOutputDir)/$(OutputName)"/>
+		<Property Name="ReportParams" Value="-ReportExportPath=&quot;$(ReportExportPath)&quot;"/>
+		<Do If="$(IsBuildMachine)">
+			<Property Name="ReportExportURL" Value="$(AutomationReportBaseUrl)/$(OutputName)/index.html"/>
+			<Property Name="ReportParams" Value="$(ReportParams) -ReportURL=&quot;$(ReportExportURL)&quot; -WriteTestResultsForHorde -HordeTestDataKey=&quot;$(NodeName) $(Phase)$(PreflightSuffix)&quot;"/>
+		</Do>
+		<Property Name="LogOutputParams" Value="-logdir=&quot;$(AutomationOutputDir)/$(OutputName)&quot;"/>
+		<Property Name="AllGauntletArgs" Value="-project=$(ProjectName) -platform=$(PlatformName) $(GauntletArgs) $(ReportParams) $(LogOutputParams) -artifactname=&quot;$(Phase)&quot;"/>
+
+		<!-- Run the Gauntlet Iteration Profile Tests -->
+		<Command Name="RunUnreal" Arguments="$(AllGauntletArgs) $(ProfileArgs) $(Args) -tracefile=&quot;$(TraceFilePath)&quot;"/>
+
+		<!-- Translate the utrace file into csv data -->
+		<Commandlet Name="SummarizeTrace" Arguments="-NoEnginePlugins -inputfile=&quot;$(TraceFilePath)&quot; -testname=&quot;$(TestName)&quot; $(SummarizeArgs)"/>
+
+		<!-- Stash the telemetry file in case this build will become the baseline in the future -->
+		<Copy From="$(TelemetryFilePath)" To="$(AutomationOutputDir)/$(TelemetryFileName)"/>
+
+		<Do If="$(IsBuildMachine)">
+			<!-- Files copied to this folder are automatically uploaded to Horde as artifacts -->
+			<Copy From="$(TraceDir)/$(ProjectName)$(PlatformName)$(TestName)*.*" To="$(RootDir)/Engine/Programs/AutomationTool/Saved/Logs"/>
+
+			<Do If="!$(IsPreflight)">
+				<!-- Publish telemetry to the db -->
+				<Command Name="PublishUnrealAutomationTelemetry" Arguments="-CSVFile=&quot;$(TelemetryFilePath)&quot; -project=$(ProjectName) -changelist=$(Change) -branch=$(Branch)"/>
+			</Do>
+		</Do>
+	</Macro>
+
+	<!-- This will be set to the names of all nodes we want to execute based on specified platforms/options -->
+	<Property Name="RunGraphNodes" Value=""/>
+
+	<!-- Mimic of the Runner that retrieves the stashed telemetry file and copies it to the depot location -->
+	<Macro Name="BaselineResult" Arguments="PlatformName;ProjectName;Phase">
+		<Property Name="TestName" Value="IterationProfile$(Phase)"/>
+		<Property Name="TelemetryFileName" Value="$(ProjectName)$(PlatformName)$(TestName)Telemetry.csv"/>
+		<Property Name="LocalTelemetryFilePath" Value="$(BaselineDir)/$(TelemetryFileName)"/>
+		<Property Name="NetworkTelemetryFilePath" Value="$(BaselineAutomationNetworkOutputDir)/$(TelemetryFileName)"/>
+		<Copy From="$(NetworkTelemetryFilePath)" To="$(LocalTelemetryFilePath)" Overwrite="true"/>
+		<Do If="!$(IsBuildMachine)">
+			<Spawn Exe="p4" Arguments="reconcile -ea $(LocalTelemetryFilePath)"/>
+		</Do>
+	</Macro>
+
+	<!-- This will be set to the names of all nodes we want to execute based on specified platforms/options -->
+	<Property Name="BaselineGraphNodes" Value=""/>
+
+	<!-- Windows -->
+	<Agent Name="Prerequisites Agent Win64" Type="Win64">
+		<Node Name="Compile Prerequisites Win64Host">
+			<Compile Target="UnrealHeaderTool" Platform="Win64" Configuration="Development"/>
+			<Compile Target="ShaderCompileWorker" Platform="Win64" Configuration="Development"/>
+			<Compile Target="CrashReportClient" Platform="Win64" Configuration="Shipping"/>
+			<Compile Target="CrashReportClientEditor" Platform="Win64" Configuration="Shipping"/>
+		</Node>
+	</Agent>
+
+	<!-- macOS -->
+	<Agent Name="Prerequisites Agent Mac" Type="TestMac">
+		<Node Name="Compile Prerequisites Mac">
+			<Compile Target="UnrealHeaderTool" Platform="Mac" Configuration="Development"/>
+			<Compile Target="ShaderCompileWorker" Platform="Mac" Configuration="Development"/>
+			<Compile Target="CrashReportClient" Platform="Mac" Configuration="Shipping"/>
+			<Compile Target="CrashReportClientEditor" Platform="Mac" Configuration="Shipping"/>
+		</Node>
+	</Agent>
+	
+	<!-- ForEach Project to run, generate the graph nodes -->
+	<ForEach Name="ProjectName" Values="$(ProjectNames)">
+
+		<!-- Windows -->
+		<Agent Name="Prerequisites Agent Win64" Type="Win64">
+			<Node Name="Compile $(ProjectName) Editor Win64" Requires="Compile Prerequisites Win64Host">
+				<Compile Target="$(ProjectName)Editor" Platform="Win64" Configuration="Development" Arguments="$(EditorCompileArgs)"/>
+			</Node>
+		</Agent>
+		<Agent Name="Automated Test Agent $(ProjectName) Win64" Type="IterationTest">
+			<Property Name="PlatformName" Value="Win64"/>
+			<Property Name="OutputName" Value="$(ProjectName)$(PlatformName)IterationProfile"/>
+			<Property Name="RunNodeName" Value="Run $(OutputName)"/>
+			<Property Name="RunNodeRequires" Value="Compile Prerequisites $(PlatformName)Host;Compile $(ProjectName) Editor $(PlatformName)"/>
+			<Property Name="BaselineNodeName" Value="Baseline $(OutputName)"/>
+			<Property Name="BaselineNodeRequires" Value=""/>
+			<Property Name="BaselineNodeRequires" Value="$(RunNodeName)" If="$(RunAndBaseline)"/>
+			<Do If="$(Win64)">
+				<!-- Run the Tests -->
+				<Node Name="$(RunNodeName)" Requires="$(RunNodeRequires)">
+					<Do If="$(ColdPass)">
+						<Expand Name="RunTest" OutputName="$(OutputName)" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" NodeName="$(RunNodeName)" Phase="Cold" Args="$(ColdArgs)"/>
+					</Do>
+					<Do If="$(WarmPass)">
+						<Expand Name="RunTest" OutputName="$(OutputName)" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" NodeName="$(RunNodeName)" Phase="Warm" Args="$(WarmArgs)"/>
+					</Do>
+				</Node>
+				<Property Name="RunGraphNodes" Value="$(RunGraphNodes);$(RunNodeName)"/>
+				<!-- Baseline the Results -->
+				<Node Name="$(BaselineNodeName)" Requires="$(BaselineNodeRequires)">
+					<Do If="$(ColdPass)">
+						<Expand Name="BaselineResult" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" Phase="Cold"/>
+					</Do>
+					<Do If="$(WarmPass)">
+						<Expand Name="BaselineResult" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" Phase="Warm"/>
+					</Do>
+				</Node>
+				<Property Name="BaselineGraphNodes" Value="$(BaselineGraphNodes);$(BaselineNodeName)"/>
+			</Do>
+		</Agent>
+		
+		<!-- macOS -->
+		<Agent Name="Prerequisites Agent Mac" Type="TestMac">
+			<Node Name="Compile $(ProjectName) Editor Mac" Requires="Compile Prerequisites Mac">
+				<Compile Target="$(ProjectName)Editor" Platform="Mac" Configuration="Development"  Arguments="$(EditorCompileArgs)"/>
+			</Node>
+		</Agent>
+		<Agent Name="Automated Test Agent $(ProjectName) Mac" Type="TestMac">
+			<Property Name="PlatformName" Value="Mac"/>
+			<Property Name="OutputName" Value="$(ProjectName)$(PlatformName)IterationProfile"/>
+			<Property Name="RunNodeName" Value="Run $(OutputName)"/>
+			<Property Name="RunNodeRequires" Value="Compile Prerequisites $(PlatformName);Compile $(ProjectName) Editor $(PlatformName)"/>
+			<Property Name="BaselineNodeName" Value="Baseline $(OutputName)"/>
+			<Property Name="BaselineNodeRequires" Value=""/>
+			<Property Name="BaselineNodeRequires" Value="$(RunNodeName)" If="$(RunAndBaseline)"/>
+			<Do If="$(MacOS)">
+				<!-- Run the Tests -->
+				<Node Name="$(RunNodeName)" Requires="$(RunNodeRequires)">
+					<Do If="$(ColdPass)">
+						<Expand Name="RunTest" OutputName="$(OutputName)" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" NodeName="$(RunNodeName)" Phase="Cold" Args="$(ColdArgs)"/>
+					</Do>
+					<Do If="$(WarmPass)">
+						<Expand Name="RunTest" OutputName="$(OutputName)" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" NodeName="$(RunNodeName)" Phase="Warm" Args="$(WarmArgs)"/>
+					</Do>
+				</Node>
+				<Property Name="RunGraphNodes" Value="$(RunGraphNodes);$(RunNodeName)"/>
+				<!-- Baseline the Results -->
+				<Node Name="$(BaselineNodeName)" Requires="$(BaselineNodeRequires)">
+					<Do If="$(ColdPass)">
+						<Expand Name="BaselineResult" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" Phase="Cold"/>
+					</Do>
+					<Do If="$(WarmPass)">
+						<Expand Name="BaselineResult" PlatformName="$(PlatformName)" ProjectName="$(ProjectName)" Phase="Warm"/>
+					</Do>
+				</Node>
+				<Property Name="BaselineGraphNodes" Value="$(BaselineGraphNodes);$(BaselineNodeName)"/>
+			</Do>
+		</Agent>
+
+		<!-- Graph nodes that really tie the room together -->
+		<Label Category="Test" Name="$(ProjectName) Iteration Profile Win64" Requires="Prerequisites Agent Win64;Automated Test Agent $(ProjectName) Win64" UgsProject="$(UgsProject)" UgsBadge="$(UgsBadge)"/>
+		<Label Category="Test" Name="$(ProjectName) Iteration Profile Mac" Requires="Prerequisites Agent Mac;Automated Test Agent $(ProjectName) Mac" UgsProject="$(UgsProject)" UgsBadge="$(UgsBadge)"/>
+		
+	</ForEach>
+
+	<!-- These Nodes run the Editor and gather profile data -->
+	<Aggregate Name="Run Iteration Profile Tests" Requires="$(RunGraphNodes)"/>
+
+	<!-- These Nodes copies the CSV telemetry files to special location in the depot, thus making them the "baselines" -->
+	<Aggregate Name="Baseline Iteration Profile Results" Requires="$(BaselineGraphNodes)"/>
+
+	<!-- This Node submits the baseline CSV files to Perforce -->
+	<!--
+	<Agent Name="Submission Agent Win64" Type="Win64">
+		<Node Name="Submit Baseline To Perforce" Requires="$(BaselineGraphNodes)">
+			<Submit Description="[CL $(Change)] Updated IterationProfile baselines" Files="$(BaselineFiles)"/>
+		</Node>
+	</Agent>
+	-->
+
+</BuildGraph>

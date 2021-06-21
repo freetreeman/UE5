@@ -1,0 +1,19 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+uint GetGPUSceneInstanceIndex(uint PrimitiveIndex, uint InstanceIndex)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	// Handle ray tracing auto instancing which can cause PrimitiveInstanceIndex to be above 0 for meshes with a single instance
+	if (GetPrimitiveData(PrimitiveIndex).NumInstanceSceneDataEntries == 1)
+	{
+		InstanceIndex = 0;
+	}
+
+	return GetPrimitiveData(PrimitiveIndex).InstanceSceneDataOffset + InstanceIndex;
+#else
+
+	return 0;
+#endif
+}

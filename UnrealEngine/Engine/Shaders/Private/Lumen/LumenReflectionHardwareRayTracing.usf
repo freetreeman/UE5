@@ -1,0 +1,181 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// TODO: Remove hair dependency
+#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../SceneTextureParameters.ush"
+
+#include "LumenCardCommon.ush"
+#include "LumenTracingCommon.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenHardwareRayTracingCommon.ush"
+
+#ifndef DIM_LIGHTING_MODE
+#define DIM_LIGHTING_MODE LIGHTING_FROM_SURFACE_CACHE
+#endif
+
+RWTexture2D<float> RWTraceHit;
+RWTexture2D<float3> RWTraceRadiance;
+
+RaytracingAccelerationStructure TLAS;
+float MaxTraceDistance;
+float PullbackBias;
+int MaxTranslucentSkipCount;
+
+StructuredBuffer<FDeferredMaterialPayload> DeferredMaterialBuffer;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenReflectionHardwareRayTracingRGS)
+{
+	uint2 ReflectionTracingCoord;
+	float TraceHitDistance = 0;
+	FDeferredMaterialPayload DeferredMaterialPayload;
+
+	if (DIM_DEFERRED_MATERIAL_MODE)
+	{
+		DeferredMaterialPayload = DeferredMaterialBuffer[DispatchRaysIndex().x];
+		ReflectionTracingCoord.x = DeferredMaterialPayload.PixelCoordinates & 0xFFFF;
+		ReflectionTracingCoord.y = DeferredMaterialPayload.PixelCoordinates >> 16;
+		TraceHitDistance = DeferredMaterialPayload.HitT;
+
+		if (DeferredMaterialPayload.SortKey == RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID)
+		{
+			return;
+		}
+	}
+	else
+	{
+		if (DispatchRaysIndex().x >= CompactedTraceTexelAllocator[0])
+		{
+			return;
+		}
+
+		DecodeTraceTexel(CompactedTraceTexelData[DispatchRaysIndex().x], ReflectionTracingCoord, TraceHitDistance);
+	}
+
+	float2 ScreenUV = GetScreenUVFromReflectionTracingCoord(ReflectionTracingCoord);
+	float2 ScreenCoord = ScreenUV * View.BufferSizeAndInvSize.xy;
+	uint LinearCoord = ScreenCoord.y * View.BufferSizeAndInvSize.x + ScreenCoord.x;
+
+	float SceneDepth = DownsampledDepth.Load(int3(ReflectionTracingCoord, 0)).x;
+	float3 WorldPosition = GetWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+	float3 WorldNormal = DecodeNormal(GBufferATexture.Load(int3(ScreenUV * View.BufferSizeAndInvSize.xy, 0)).xyz);
+
+	FRayData RayData = DecodeRayData(RayBuffer[ReflectionTracingCoord]);
+
+	RayDesc Ray;
+	Ray.Origin = WorldPosition;
+	Ray.Direction = RayData.Direction;
+	float RayBias = 0.05;
+	Ray.TMin = max(TraceHitDistance - PullbackBias, RayBias);
+	Ray.TMax = MaxTraceDistance;
+
+	float NormalBias = 0.05;
+	ApplyPositionBias(Ray.Origin, Ray.Direction, WorldNormal, NormalBias);
+
+	FRayCone RayCone = (FRayCone)0;
+	RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+	RayCone = PropagateRayCone(RayCone, RayData.ConeHalfAngle, SceneDepth);
+
+	// Always use highest available mip maps for reflections
+	const bool bHiResSurface = true;
+	const bool bCullBackFacingTriangles = true;
+
+	FRayTracedLightingContext Context = CreateRayTracedLightingContext(
+		TLAS,
+		RayCone,
+		ReflectionTracingCoord,
+		LinearCoord,
+		bCullBackFacingTriangles,
+		MaxTranslucentSkipCount,
+		bHiResSurface);
+
+	bool bTraceRay = true;
+	if (DIM_DEFERRED_MATERIAL_MODE)
+	{
+		bTraceRay = DeferredMaterialPayload.SortKey < RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS;
+		if (bTraceRay)
+		{
+			float Epsilon = 0.5;
+			Ray.TMin = max(0, DeferredMaterialPayload.HitT - Epsilon);
+			// Note: adjusting TMax will not properly account for masked materials because of restricted any-hit length
+			//Ray.TMax = DeferredMaterialPayload.HitT + Epsilon;
+		}
+	}
+
+	bool bHit = false;
+	float3 Radiance = 0;
+	if (bTraceRay)
+	{
+		bool bUseMinimalPayload = (DIM_LIGHTING_MODE == LIGHTING_FROM_SURFACE_CACHE) && (DIM_DEFERRED_MATERIAL_MODE == 0);
+		if (bUseMinimalPayload)
+		{
+			bHit = TraceAndCalculateRayTracedLightingFromSurfaceCache(Ray, Context, TraceHitDistance, Radiance);
+		}
+		else
+		{
+			bHit = TraceAndCalculateRayTracedLighting(Ray, Context, DIM_LIGHTING_MODE, TraceHitDistance, Radiance);
+		}
+	}
+
+	Radiance *= View.PreExposure;
+	RWTraceRadiance[ReflectionTracingCoord] = Radiance;
+	RWTraceHit[ReflectionTracingCoord] = EncodeRayDistance(TraceHitDistance, bHit);
+}
+
+RWStructuredBuffer<FDeferredMaterialPayload> RWDeferredMaterialBuffer;
+int2 DeferredMaterialBufferResolution;
+uint TileSize;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenReflectionHardwareRayTracingDeferredMaterialRGS)
+{
+	FDeferredMaterialPayload DeferredMaterialPayload = (FDeferredMaterialPayload)0;
+	uint DeferredMaterialBufferIndex = DispatchRaysIndex().x;
+	if (DispatchRaysIndex().x >= CompactedTraceTexelAllocator[0])
+	{
+		DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID;
+		RWDeferredMaterialBuffer[DeferredMaterialBufferIndex] = DeferredMaterialPayload;
+		return;
+	}
+
+	uint2 ReflectionTracingCoord;
+	float TraceHitDistance = 0;
+	DecodeTraceTexel(CompactedTraceTexelData[DeferredMaterialBufferIndex], ReflectionTracingCoord, TraceHitDistance);
+
+	float2 ScreenUV = GetScreenUVFromReflectionTracingCoord(ReflectionTracingCoord);
+	float2 ScreenCoord = ScreenUV * View.BufferSizeAndInvSize.xy;
+	uint LinearCoord = ScreenCoord.y * View.BufferSizeAndInvSize.x + ScreenCoord.x;
+
+	float SceneDepth = DownsampledDepth.Load(int3(ReflectionTracingCoord, 0)).x;
+	float3 WorldPosition = GetWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+	float3 WorldNormal = DecodeNormal(GBufferATexture.Load(int3(ScreenUV * View.BufferSizeAndInvSize.xy, 0)).xyz);
+
+	FRayData RayData = DecodeRayData(RayBuffer[ReflectionTracingCoord]);
+
+	RayDesc Ray;
+	Ray.Origin = WorldPosition;
+	Ray.Direction = RayData.Direction;
+	float RayBias = 0.05;
+	Ray.TMin = max(TraceHitDistance - PullbackBias, RayBias);
+	Ray.TMax = MaxTraceDistance;
+
+	float NormalBias = 0.05;
+	ApplyPositionBias(Ray.Origin, Ray.Direction, WorldNormal, NormalBias);
+
+	FRayCone RayCone = (FRayCone)0;
+	RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+	RayCone = PropagateRayCone(RayCone, RayData.ConeHalfAngle, SceneDepth);
+
+	const bool bCullBackFacingTriangles = true;
+	FRayTracedLightingContext Context = CreateRayTracedLightingContext(TLAS, RayCone, ReflectionTracingCoord, LinearCoord, bCullBackFacingTriangles);
+	bool bIsHit = TraceDeferredMaterialRay(Ray, Context, DeferredMaterialPayload);
+
+	// Encode max trace distance in the case of an invalid or miss condition
+	if (!bIsHit)
+	{
+		DeferredMaterialPayload.HitT = MaxTraceDistance;
+	}
+
+	RWDeferredMaterialBuffer[DeferredMaterialBufferIndex] = DeferredMaterialPayload;
+}

@@ -1,0 +1,85 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ShadingCommon.ush"
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+#include "/Engine/Private/RayTracing/RayTracingHitGroupCommon.ush"
+#include "NiagaraRayTracingCommon.ush"
+
+RaytracingAccelerationStructure               TLAS;
+StructuredBuffer<FBasicRayData>               Rays;
+RWStructuredBuffer<FNiagaraRayTracingPayload> CollisionOutput;
+
+#if NIAGARA_RAYTRACE_FAKE_INDIRECT
+Buffer<uint>                                  RayTraceCounts;
+#endif
+
+RAY_TRACING_ENTRY_RAYGEN(NiagaraCollisionRayTraceRG)
+{
+	const uint RayIndex = DispatchRaysIndex().x;
+
+#if NIAGARA_RAYTRACE_FAKE_INDIRECT
+	if (RayIndex >= RayTraceCounts[0])
+	{
+		return;
+	}
+#endif
+
+	FBasicRayData InputRay = Rays[RayIndex];
+
+	RayDesc Ray;
+	Ray.Origin = InputRay.Origin;
+	Ray.Direction = InputRay.Direction;
+	Ray.TMin = 0.0f;
+	Ray.TMax = InputRay.TFar;
+
+	uint RayFlags = RAY_FLAG_FORCE_OPAQUE; // don't run anyhit shader
+
+	FNiagaraRayTracingPayload Payload = (FNiagaraRayTracingPayload)0;
+
+	TraceRay(
+		TLAS,   // AccelerationStructure
+		RayFlags,
+		RAY_TRACING_MASK_OPAQUE,          // InstanceInclusionMask
+		RAY_TRACING_SHADER_SLOT_MATERIAL, // RayContributionToHitGroupIndex
+		RAY_TRACING_NUM_SHADER_SLOTS,     // MultiplierForGeometryContributionToShaderIndex
+		0,      // MissShaderIndex
+		Ray,    // RayDesc
+		Payload // Payload
+	);
+
+	CollisionOutput[RayIndex].HitT = Payload.HitT;
+	if (CollisionOutput[RayIndex].IsHit())
+	{
+		CollisionOutput[RayIndex].WorldPosition = Payload.WorldPosition;
+		CollisionOutput[RayIndex].WorldNormal = Payload.WorldNormal;
+	}
+}
+
+float3 GetBarycentricPosition(FDefaultAttributes Attributes, FTriangleBaseAttributes Tri)
+{
+	return (1.0f - Attributes.Barycentrics.x - Attributes.Barycentrics.y) * Tri.LocalPositions[0]
+		+ Attributes.Barycentrics.x * Tri.LocalPositions[1]
+		+ Attributes.Barycentrics.y * Tri.LocalPositions[2];
+}
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(NiagaraCollisionRayTraceCH,
+	FNiagaraRayTracingPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+	Payload.HitT = RayTCurrent();
+
+	FTriangleBaseAttributes Tri = LoadTriangleBaseAttributes(PrimitiveIndex());
+	float3 LocalPosition = GetBarycentricPosition(Attributes, Tri);
+	float3 LocalEdges[2] = { Tri.LocalPositions[1] - Tri.LocalPositions[0], Tri.LocalPositions[2] - Tri.LocalPositions[0] };
+	float3 LocalNormal = cross(LocalEdges[1], LocalEdges[0]);
+	float3x3 InverseTranspose3x3 = transpose((float3x3)WorldToObject4x3());
+
+	Payload.WorldPosition = mul(float4(LocalPosition, 1.0f), ObjectToWorld4x3()).xyz;
+	Payload.WorldNormal = normalize(mul(LocalNormal, InverseTranspose3x3));
+}
+
+RAY_TRACING_ENTRY_MISS(NiagaraCollisionRayTraceMiss, FNiagaraRayTracingPayload, Payload)
+{
+	Payload.SetMiss();
+}

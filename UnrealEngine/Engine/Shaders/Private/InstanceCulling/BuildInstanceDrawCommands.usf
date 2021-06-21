@@ -1,0 +1,354 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "InstanceCullingCommon.ush"
+
+struct FInstanceRun
+{
+	uint Start;
+	uint EndInclusive;
+	int PrimitiveId;
+};
+
+struct FBatchInfo
+{
+	uint CullingCommandsOffset;
+	uint NumCullingCommands;
+	uint PrimitiveIdsOffset;
+	uint NumPrimitiveIds;
+	uint InstanceRunsOffset;
+	uint NumInstanceRuns;
+	uint ViewIdsOffset;
+	uint NumViewIds;
+	int DynamicPrimitiveIdOffset;
+	int DynamicPrimitiveIdMax;
+};
+
+
+RWStructuredBuffer<uint> InstanceIdsBufferOut;
+RWStructuredBuffer<uint> DrawCommandIdsBufferOut;
+
+RWBuffer<uint> DrawIndirectArgsBufferOut;
+RWBuffer<uint> InstanceIdOffsetBufferOut;
+RWStructuredBuffer<uint> OutputOffsetBufferOut;
+
+StructuredBuffer<FInstanceRun> InstanceRuns;
+StructuredBuffer<uint> ViewIds;
+
+StructuredBuffer<FBatchInfo> BatchInfos;
+StructuredBuffer<uint> BatchInds;
+
+groupshared uint PrimitiveInstanceCountGroupShared;
+groupshared uint RunInstanceCountGroupShared;
+groupshared uint InstanceIdOffsetGroupShared;
+groupshared uint FinalInstanceCountGroupShared;
+
+StructuredBuffer<FPrimCullingCommand> PrimitiveCullingCommands;
+StructuredBuffer<uint> PrimitiveIds;
+
+// These flags are not supplied if the culling is disabled either for testing or because there is no data
+#if CULL_INSTANCES
+StructuredBuffer<uint> VisibleInstanceFlags;
+uint NumInstanceFlagWords;
+uint NumCulledInstances;
+uint NumCulledViews;
+#endif
+
+#if DEBUG_MODE
+int bDrawOnlyVSMInvalidatingGeometry;
+uint InstanceSceneDataSOAStride;
+#endif
+
+uint NumPrimitiveIds;
+uint NumInstanceRuns;
+int NumCommands;
+uint NumViewIds;
+int DynamicPrimitiveIdOffset;
+int DynamicPrimitiveIdMax;
+
+
+/**
+ * Check if the PRIM_ID_DYNAMIC_FLAG bit is set on the Primitive ID and if so add the dynamic primitive offset to get the GPU-Scene ID.
+ */
+uint TranslatePrimitiveId(uint PrimitiveIdIn, FBatchInfo BatchInfo)
+{
+	// This means we defer the translation to later
+	if (BatchInfo.DynamicPrimitiveIdOffset == -1)
+	{
+		return PrimitiveIdIn;
+	}
+
+	uint PrimitiveId = PrimitiveIdIn;
+	if ((PrimitiveIdIn & PRIM_ID_DYNAMIC_FLAG) != 0)
+	{
+		uint DynamicPrimitiveIndex = PrimitiveIdIn & (~PRIM_ID_DYNAMIC_FLAG);
+		PrimitiveId = uint(BatchInfo.DynamicPrimitiveIdOffset) + DynamicPrimitiveIndex;
+	}
+
+	return PrimitiveId;
+}
+
+
+bool TestInstanceVisibilityBit(uint InstanceId, uint ViewId)
+{
+#if CULL_INSTANCES
+	if (InstanceId < NumCulledInstances && ViewId < NumCulledViews)
+	{
+		uint ViewWordOffset = ViewId * NumInstanceFlagWords;
+		uint WordOffset = ViewWordOffset + InstanceId / 32U;
+		return (VisibleInstanceFlags[WordOffset] & (1U << (InstanceId % 32U))) != 0U;
+	}
+#endif
+	return true;
+}
+
+
+void WriteInstanceId(uint Offset, uint InstanceId, uint ViewIdIndex, uint DrawCommandId)
+{
+	uint PackedId = InstanceId | (ViewIdIndex << 28U);
+	InstanceIdsBufferOut[Offset] = PackedId;
+#if OUTPUT_COMMAND_IDS
+	DrawCommandIdsBufferOut[Offset] = DrawCommandId;
+#endif
+}
+
+
+/**
+ */
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void BuildInstanceIdBufferAndCommandsFromPrimitiveIdsCs(uint GroupThreadIndex : SV_GroupIndex, uint GroupId : SV_GroupID)
+{
+	int CommandSlotIndex = int(GroupId);
+	FPrimCullingCommand Cmd = PrimitiveCullingCommands[CommandSlotIndex];
+
+	// 1. Figure out the total number of instances
+	PrimitiveInstanceCountGroupShared = 0;
+	RunInstanceCountGroupShared = 0;
+	InstanceIdOffsetGroupShared = 0;
+	FinalInstanceCountGroupShared = 0;
+	GroupMemoryBarrierWithGroupSync();
+
+#if ENABLE_BATCH_MODE
+	// Load batch info, 
+	FBatchInfo BatchInfo = BatchInfos[BatchInds[CommandSlotIndex]];
+#else // !ENABLE_BATCH_MODE
+	// Single batch in the call, set up batch from the kernel parameters
+	FBatchInfo BatchInfo;
+	BatchInfo.CullingCommandsOffset = 0U;
+	BatchInfo.NumCullingCommands = NumCommands;
+	BatchInfo.PrimitiveIdsOffset = 0U;
+	BatchInfo.NumPrimitiveIds = NumPrimitiveIds;
+	BatchInfo.InstanceRunsOffset = 0U;
+	BatchInfo.NumInstanceRuns = NumInstanceRuns;
+	BatchInfo.ViewIdsOffset = 0U;
+	BatchInfo.NumViewIds = NumViewIds;
+	BatchInfo.DynamicPrimitiveIdOffset = DynamicPrimitiveIdOffset;
+	BatchInfo.DynamicPrimitiveIdMax = DynamicPrimitiveIdMax;
+
+#endif // ENABLE_BATCH_MODE
+
+	uint BatchCommandSlotIndex = CommandSlotIndex - BatchInfo.CullingCommandsOffset;
+	// Get start of next CMD or go to end.
+	uint LastOffset = (BatchCommandSlotIndex + 1 < BatchInfo.NumCullingCommands) ? PrimitiveCullingCommands[CommandSlotIndex + 1].FirstPrimitiveIdOffset : BatchInfo.NumPrimitiveIds;
+	// Note: the max here is purely to safe-guard against corrupted buffer data leading to an infinite loop
+	uint NumCmdPrimitiveIds = min(BatchInfo.NumPrimitiveIds, LastOffset - Cmd.FirstPrimitiveIdOffset);
+
+	uint LastInstanceRunOffset = (BatchCommandSlotIndex + 1 < BatchInfo.NumCullingCommands) ? PrimitiveCullingCommands[CommandSlotIndex + 1].FirstInstanceRunOffset : BatchInfo.NumInstanceRuns;
+	// Note: the min here is purely to safe-guard against corrupted buffer data leading to an infinite loop
+	uint NumCmdInstanceRuns = min(BatchInfo.NumInstanceRuns, LastInstanceRunOffset - Cmd.FirstInstanceRunOffset);
+
+	for (uint Index = GroupThreadIndex; Index < NumCmdPrimitiveIds + NumCmdInstanceRuns; Index += NUM_THREADS_PER_GROUP)
+	{
+		uint Num = 0;
+		if (Index < NumCmdPrimitiveIds)
+		{
+			uint PrimitiveId = TranslatePrimitiveId(PrimitiveIds[BatchInfo.PrimitiveIdsOffset + Cmd.FirstPrimitiveIdOffset + Index], BatchInfo);
+			if (GetPrimitiveData(PrimitiveId).InstanceSceneDataOffset >= 0)
+			{
+				Num = GetPrimitiveData(PrimitiveId).NumInstanceSceneDataEntries;
+			}
+			else
+			{
+				// Fake entry for invalid ones -> shaders that will not use the instancing data anyway
+				Num = 1;
+			}
+			InterlockedAdd(PrimitiveInstanceCountGroupShared, Num);
+		}
+		else
+		{
+			FInstanceRun Run = InstanceRuns[BatchInfo.InstanceRunsOffset + Cmd.FirstInstanceRunOffset + Index - NumCmdPrimitiveIds];
+			Num = (Run.EndInclusive + 1) - Run.Start;
+
+			InterlockedAdd(RunInstanceCountGroupShared, Num);
+		}
+
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	uint PrimitiveInstanceCount = PrimitiveInstanceCountGroupShared;
+	uint RunInstanceCount = RunInstanceCountGroupShared;
+	// Note: NumViewIds - replicate for each view in instanced stereo or other multi-view
+	uint CommandInstanceCount = BatchInfo.NumViewIds * (PrimitiveInstanceCount + RunInstanceCount);
+
+	// Bail if no instances to output
+	if (CommandInstanceCount > 0)
+	{
+		// 2. Allocate output offset (over-allocates for max number, culling may remove any number)
+		if (GroupThreadIndex == 0)
+		{
+			uint IdOutputStart = 0;
+			InterlockedAdd(OutputOffsetBufferOut[0], CommandInstanceCount, IdOutputStart);
+			InstanceIdOffsetGroupShared = IdOutputStart;
+			InstanceIdOffsetBufferOut[CommandSlotIndex] = IdOutputStart;
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// 3. Broadcast to all threads
+		uint InstanceIdOutputOffset = InstanceIdOffsetGroupShared;
+		{
+			uint PrimitiveId = TranslatePrimitiveId(PrimitiveIds[BatchInfo.PrimitiveIdsOffset + Cmd.FirstPrimitiveIdOffset], BatchInfo);
+			WriteInstanceId(InstanceIdOutputOffset, GetPrimitiveData(PrimitiveId).InstanceSceneDataOffset, 0U, CommandSlotIndex);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		int CurrentPrimitiveIdIndex = -1;
+
+		uint CurrentRangeStart = 0;
+		uint CurrentRangeEnd = 0;
+		int InstanceSceneDataOffset = 0;
+
+		// 4. loop over output primitive instance number
+		for (uint OutputIndex1 = GroupThreadIndex; OutputIndex1 < PrimitiveInstanceCount; OutputIndex1 += NUM_THREADS_PER_GROUP)
+		{
+			// Naive search for range containing the output index (reasonably efficient for large runs, bad for many small runs)
+			while (OutputIndex1 >= CurrentRangeEnd)
+			{
+				CurrentPrimitiveIdIndex += 1;
+				uint PrimitiveId = TranslatePrimitiveId(PrimitiveIds[BatchInfo.PrimitiveIdsOffset + Cmd.FirstPrimitiveIdOffset + CurrentPrimitiveIdIndex], BatchInfo);
+
+				CurrentRangeStart = CurrentRangeEnd;
+				InstanceSceneDataOffset = GetPrimitiveData(PrimitiveId).InstanceSceneDataOffset;
+				CurrentRangeEnd += max(1, GetPrimitiveData(PrimitiveId).NumInstanceSceneDataEntries);
+			}
+
+			uint OutId = InstanceSceneDataOffset >= 0 ? uint(InstanceSceneDataOffset) + OutputIndex1 - CurrentRangeStart : 0U;
+
+			bool bIsVisible = true;
+#if DEBUG_MODE
+			BRANCH
+			if (InstanceSceneDataOffset >= 0 && bDrawOnlyVSMInvalidatingGeometry != 0)
+			{
+				FInstanceSceneData InstanceSceneData = GetInstanceSceneData(OutId, InstanceSceneDataSOAStride);
+				const bool bHasMoved = GetGPUSceneFrameNumber() == InstanceSceneData.LastUpdateSceneFrameNumber || Cmd.bMaterialMayModifyPosition;
+				const bool bCastShadow = (GetPrimitiveData(InstanceSceneData.PrimitiveId).Flags & 1u) != 0u;
+
+				bIsVisible = bHasMoved && bCastShadow;
+			}
+#endif // DEBUG_MODE
+
+			BRANCH
+			if (bIsVisible)
+			{
+				// In stereo mode we need to output all the instances in pairs, one for each eye
+#if STEREO_CULLING_MODE
+				if (InstanceSceneDataOffset < 0 || TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + 0]) || TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + 1]))
+				{
+					uint OutputOffset = 0;
+					InterlockedAdd(FinalInstanceCountGroupShared, 2, OutputOffset);
+
+					for (uint ViewIdIndex = 0; ViewIdIndex < BatchInfo.NumViewIds; ++ViewIdIndex)
+					{
+						WriteInstanceId(InstanceIdOutputOffset + OutputOffset + ViewIdIndex, OutId, ViewIdIndex, CommandSlotIndex);
+					}
+				}
+#else // !STEREO_CULLING_MODE
+				for (uint ViewIdIndex = 0; ViewIdIndex < BatchInfo.NumViewIds; ++ViewIdIndex)
+				{
+					if (InstanceSceneDataOffset < 0 || TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + ViewIdIndex]))
+					{
+						uint OutputOffset = 0;
+						InterlockedAdd(FinalInstanceCountGroupShared, 1, OutputOffset);
+						WriteInstanceId(InstanceIdOutputOffset + OutputOffset, OutId, ViewIdIndex, CommandSlotIndex);
+					}
+				}
+#endif // STEREO_CULLING_MODE
+			}
+		}
+		// repeat process for the runs
+		CurrentRangeStart = 0;
+		CurrentRangeEnd = 0;
+		InstanceSceneDataOffset = 0;
+		FInstanceRun Run = (FInstanceRun)0;
+		int CurrentRunIndex = -1;
+		for (uint OutputIndex2 = GroupThreadIndex; OutputIndex2 < RunInstanceCount; OutputIndex2 += NUM_THREADS_PER_GROUP)
+		{
+			// Naive search for range containing the output index (reasonably efficient for large runs, bad for many small runs)
+			while (OutputIndex2 >= CurrentRangeEnd)
+			{
+				CurrentRunIndex += 1;
+				Run = InstanceRuns[BatchInfo.InstanceRunsOffset + Cmd.FirstInstanceRunOffset + CurrentRunIndex];
+
+				CurrentRangeStart = CurrentRangeEnd;
+				CurrentRangeEnd += (Run.EndInclusive + 1) - Run.Start;
+				InstanceSceneDataOffset = GetPrimitiveData(Run.PrimitiveId).InstanceSceneDataOffset;
+			}
+
+			uint OutId = uint(InstanceSceneDataOffset) + Run.Start + OutputIndex2 - CurrentRangeStart;
+
+			bool bIsVisible = true;
+#if DEBUG_MODE
+			BRANCH
+			if (bDrawOnlyVSMInvalidatingGeometry != 0)
+			{
+				FInstanceSceneData InstanceData = GetInstanceSceneData(OutId, InstanceSceneDataSOAStride);
+				const bool bHasMoved = GetGPUSceneFrameNumber() == InstanceData.LastUpdateSceneFrameNumber || Cmd.bMaterialMayModifyPosition;
+				const bool bCastShadow = (GetPrimitiveData(Run.PrimitiveId).Flags & 1u) != 0u;
+
+				bIsVisible = bHasMoved && bCastShadow;
+			}
+#endif // DEBUG_MODE
+
+			BRANCH
+			if (bIsVisible)
+			{
+				// In stereo mode we need to output all the instances in pairs, one for each eye, thus they must be atomically allocated in pairs also
+#if STEREO_CULLING_MODE
+				if (TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + 0]) || TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + 1]))
+				{
+					uint OutputOffset = 0;
+					InterlockedAdd(FinalInstanceCountGroupShared, 2, OutputOffset);
+					for (uint ViewIdIndex = 0; ViewIdIndex < BatchInfo.NumViewIds; ++ViewIdIndex)
+					{
+						WriteInstanceId(InstanceIdOutputOffset + OutputOffset + ViewIdIndex, OutId, ViewIdIndex, CommandSlotIndex);
+					}
+				}
+
+#else // !STEREO_CULLING_MODE
+				for (uint ViewIdIndex = 0; ViewIdIndex < BatchInfo.NumViewIds; ++ViewIdIndex)
+				{
+					if (TestInstanceVisibilityBit(OutId, ViewIds[BatchInfo.ViewIdsOffset + ViewIdIndex]))
+					{
+						uint OutputOffset = 0;
+						InterlockedAdd(FinalInstanceCountGroupShared, 1, OutputOffset);
+						WriteInstanceId(InstanceIdOutputOffset + OutputOffset, OutId, ViewIdIndex, CommandSlotIndex);
+					}
+				}
+#endif // STEREO_CULLING_MODE
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// Generate draw command
+	if (GroupThreadIndex == 0)
+	{
+		DrawIndirectArgsBufferOut[CommandSlotIndex * INDIRECT_ARGS_NUM_WORDS + 0] = Cmd.NumVerticesOrIndices;
+		DrawIndirectArgsBufferOut[CommandSlotIndex * INDIRECT_ARGS_NUM_WORDS + 1] = FinalInstanceCountGroupShared;
+		DrawIndirectArgsBufferOut[CommandSlotIndex * INDIRECT_ARGS_NUM_WORDS + 2] = Cmd.FirstIndex;
+		DrawIndirectArgsBufferOut[CommandSlotIndex * INDIRECT_ARGS_NUM_WORDS + 3] = Cmd.BaseVertexIndex;
+		DrawIndirectArgsBufferOut[CommandSlotIndex * INDIRECT_ARGS_NUM_WORDS + 4] = 0U;
+
+	}
+	GroupMemoryBarrierWithGroupSync();
+}

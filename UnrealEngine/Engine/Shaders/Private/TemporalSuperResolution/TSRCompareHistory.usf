@@ -1,0 +1,149 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TSRCommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define CONFIG_OUTPUT_HALF_RES DIM_OUTPUT_HALF_RES
+
+#define TILE_SIZE 16
+
+
+//------------------------------------------------------- PARAMETERS
+
+Texture2D<taa_half> ParallaxRejectionMaskTexture;
+Texture2D<taa_half3> FilteredInputTexture;
+Texture2D<taa_half3> FilteredPredictionSceneColorTexture;
+Texture2D<taa_half> InterferenceWeightTexture;
+
+RWTexture2D<taa_half> HistoryRejectionOutput;
+
+
+//------------------------------------------------------- LDS
+
+groupshared taa_half SharedRejection[TILE_SIZE * TILE_SIZE];
+
+
+//------------------------------------------------------- FUNCTIONS
+
+taa_half3 TransformColorForClampingBox(taa_half3 Color)
+{
+	return RGBToYCoCg(Color);
+}
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	taa_short2 InputPixelPos = (
+		taa_short2(InputPixelPosMin) +
+		taa_short2(GroupId) * taa_short2(TILE_SIZE, TILE_SIZE) +
+		Map16x16Tile2x2Lane(GroupThreadIndex));
+
+	taa_half3 InputMinColor;
+	taa_half3 InputMaxColor;
+	taa_half3 InputCenterColor;
+	taa_half ParallaxRejectionMask;
+	taa_half InterferenceWeight;
+	{
+		InputCenterColor = TransformColorForClampingBox(FilteredInputTexture[InputPixelPos]);
+		ParallaxRejectionMask = ParallaxRejectionMaskTexture[InputPixelPos];
+
+		InputMinColor = InputCenterColor;
+		InputMaxColor = InputCenterColor;
+		
+		InterferenceWeight = InterferenceWeightTexture[InputPixelPos];
+	}
+
+	UNROLL
+	for (uint i = 0; i < 9; i++)
+	{
+		if (i == 4)
+		{
+			continue;
+		}
+		
+		taa_short2 SampleInputPixelPos = InputPixelPos + ClampPixelOffset(
+			InputPixelPos,
+			kOffsets3x3[i], kOffsets3x3[i],
+			InputPixelPosMin, InputPixelPosMax);
+
+		taa_half3 Color = TransformColorForClampingBox(FilteredInputTexture[SampleInputPixelPos]);
+
+		InputMinColor = min(InputMinColor, Color);
+		InputMaxColor = max(InputMaxColor, Color);
+	}
+
+	taa_half3 PrevColor = TransformColorForClampingBox(FilteredPredictionSceneColorTexture[InputPixelPos]);
+
+	taa_half Rejection = 1.0;
+	#if 1
+	{
+		taa_half3 ClampedPrevColor = clamp(PrevColor, InputMinColor, InputMaxColor);
+
+		Rejection = MeasureRejectionFactor(
+			PrevColor, ClampedPrevColor,
+			InputCenterColor, InputMinColor, InputMaxColor,
+			MeasureBackbufferLDRQuantizationErrorFromHDRLuma(max(PrevColor[0], ClampedPrevColor[0])));
+		
+		Debug.rgb = abs(YCoCgToRGB(PrevColor - ClampedPrevColor)) / max3(YCoCgToRGB(InputMaxColor), YCoCgToRGB(InputCenterColor), 0.01);
+	}
+	#endif
+	
+	FLATTEN
+	if (bEnableInterferenceHeuristic)
+	{
+		Rejection = saturate(Rejection + 1.0 - InterferenceWeight);
+	}
+
+	if (ParallaxRejectionMask < taa_half(PARALLAX_REJECTION_MASK_THRESHOLD))
+	{
+		Rejection = taa_half(1.0);
+	}
+
+	#if CONFIG_OUTPUT_HALF_RES
+	{
+		SharedRejection[GroupThreadIndex] = Rejection;
+
+		GroupMemoryBarrierWithGroupSync();
+
+		UNROLL
+		for (uint i = 1; i < 4; i++)
+		{
+			uint ButterflySwap = i;
+
+			Rejection = min(Rejection, SharedRejection[GroupThreadIndex ^ ButterflySwap]);
+		}
+
+		bool bIsValid = all(InputPixelPos <= taa_short2(InputPixelPosMax)) && all((taa_ushort2(InputPixelPos - taa_short2(InputPixelPosMin)) % taa_ushort(2)) == taa_ushort(0));
+
+		taa_ushort2 OutputPixelPos = taa_ushort2(InputPixelPos - taa_short2(InputPixelPosMin)) / taa_ushort(2);
+		OutputPixelPos.x = bIsValid ? OutputPixelPos.x : ~taa_ushort(0);
+
+		HistoryRejectionOutput[OutputPixelPos] = Rejection;
+	}
+	#else
+	{
+		bool bIsValid = all(InputPixelPos <= taa_short2(InputPixelPosMax));
+
+		taa_ushort2 OutputPixelPos = taa_ushort2(InputPixelPos - taa_short2(InputPixelPosMin));
+		OutputPixelPos.x = bIsValid ? OutputPixelPos.x : ~taa_ushort(0);
+
+		HistoryRejectionOutput[OutputPixelPos] = Rejection;
+	}
+	#endif
+
+	#if DEBUG_OUTPUT
+	{
+		taa_short2 OutputPixelPos = InvalidateOutputPixelPos(taa_ushort2(InputPixelPos), InputPixelPosMax);
+		DebugOutput[OutputPixelPos] = Debug;
+	}
+	#endif
+}

@@ -1,0 +1,96 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+
+
+float3 StrataForwardLighting(
+	float3 MaterialParametersWorldNormal,
+	float3 V,
+	float3 L,
+	float3 LColor,
+	float3 LShadow,
+	float3 IndirectOcclusion,
+	FStrataPixelHeader Header,
+	FStrataData StrataData,
+	inout float3 OutThroughput
+	)
+{
+	FStrataAddressing NullStrataAddressing = (FStrataAddressing)0;	// Fake unused in StrataCreateBSDFContext when using Forward inline shading
+
+	const float OpaqueBSDFThroughput = 0.0f;
+	const float FullThroughput = 1.0f;
+
+	float3 Color = 0;
+	OutThroughput = 1.0f;
+
+	UNROLL
+	for (int l = 0; l < StrataData.LayerCount; ++l)
+	{
+		float3 LayerThroughput = 0.0f;
+		float3 LayerCoverage = 0.0f;
+
+		const bool bTopLayer = l == 0;
+		const bool bBottomLayer = l == (StrataData.LayerCount - 1);
+
+		UNROLL
+		for (int i = 0; i < StrataData.Layers[l].BSDFCount; ++i)
+		{
+			FStrataBSDF BSDF = StrataData.Layers[l].BSDFs[i];
+
+			// Sanitize BSDF before it is used for forward shading
+			StrataSanitizeBSDF(BSDF);
+
+			BRANCH
+			if(BSDF_GETTYPE(BSDF) == STRATA_BSDF_TYPE_SLAB)
+			{
+				// We want simple volumetric only if the DMFP input is pluged in, otherwise we avoid dealing with simple volumetric
+				const bool bIsSimpleVolume = BSDF_GETHASDMFP(BSDF);
+				if (bIsSimpleVolume)
+				{
+					EnableSlabBSDFSimpleVolumetric(BSDF);
+				}
+			}
+
+			const float3 BSDFCoverage = BSDF.Coverage;
+
+			// Create the BSDF context
+			FStrataBSDFContext StrataBSDFContext = StrataCreateBSDFContext(Header, BSDF, NullStrataAddressing, V, L);
+
+			// Compute some common factors
+			const float3 DirLightBaseFactor = OutThroughput * BSDFCoverage * LColor * LShadow;
+			const float3 DirLightGeometryFactor = DirLightBaseFactor * StrataBSDFProjectedSolidAngleFactor(StrataBSDFContext);
+			const float3 SkyLightCommonFactor = OutThroughput * BSDFCoverage * ResolvedView.SkyLightColor.rgb * IndirectOcclusion;
+
+			// Evaluate environment lighting
+			const bool bEnableSpecular = ReflectionStruct.SkyLightParameters.y > 0.0f;
+			FStrataEnvLightResult StrataEnvLight = StrataEvaluateForEnvLight(StrataBSDFContext, bEnableSpecular);
+			if (any(StrataEnvLight.DiffuseWeight > 0.0f))
+			{
+				Color += GetEffectiveSkySHDiffuse(StrataEnvLight.DiffuseNormal) * StrataEnvLight.DiffuseWeight * SkyLightCommonFactor;
+			}
+			if (any(StrataEnvLight.SpecularWeight > 0.0f))
+			{
+				float SkyAverageBrightness = 1.0f;
+				Color += GetSkyLightReflection(StrataEnvLight.SpecularDirection, StrataEnvLight.SpecularSafeRoughness, SkyAverageBrightness) * StrataEnvLight.SpecularWeight * SkyLightCommonFactor;
+			}
+
+			// Evaluate the lighting coming from L (it will also contain the BSDF throughput to the next layer)
+			FStrataEvaluateResult StrataEvaluate = StrataEvaluateBSDF(StrataBSDFContext);
+			Color += (StrataEvaluate.DiffusePathValue + StrataEvaluate.SpecularPathValue) * DirLightGeometryFactor 
+					+ StrataEvaluate.EmissivePathValue * OutThroughput;
+
+			LayerCoverage	+= BSDFCoverage;
+			LayerThroughput += BSDFCoverage * StrataEvaluate.Throughput;
+		}
+
+		// Take into account the non covered part for this layer and update throughput accordingly
+		LayerThroughput += (1.0 - saturate(LayerCoverage)) * FullThroughput;
+
+		// And combine this layer throughtput with he material throughput
+		OutThroughput *= LayerThroughput;
+	}
+	return Color;
+}
+
+

@@ -1,0 +1,157 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "NaniteDataDecode.ush"
+
+#define PERSISTENT_CLUSTER_CULLING_GROUP_SIZE	64														// must match define in NaniteResources.h
+
+#define MAX_BVH_NODE_FANOUT_BITS				3														// must match define in NaniteResources.h
+#define MAX_BVH_NODE_FANOUT_MASK				((1 << MAX_BVH_NODE_FANOUT_BITS)-1)						// must match define in NaniteResources.h
+#define MAX_BVH_NODE_FANOUT						(1 << MAX_BVH_NODE_FANOUT_BITS)							// must match define in NaniteResources.h
+#define BVH_NODE_ENABLE_MASK					((1 << MAX_BVH_NODE_FANOUT)-1)
+
+#define MAX_BVH_NODES_PER_GROUP					(PERSISTENT_CLUSTER_CULLING_GROUP_SIZE / MAX_BVH_NODE_FANOUT)
+
+#define CULLING_PASS_NO_OCCLUSION				0
+#define CULLING_PASS_OCCLUSION_MAIN				1
+#define CULLING_PASS_OCCLUSION_POST				2
+#define CULLING_PASS_EXPLICIT_LIST				3
+
+
+uint MaxCandidateClusters;
+
+struct FCandidateNode
+{
+	uint	Flags;
+	uint	ViewId;
+	uint	InstanceId;
+	uint	NodeIndex;
+	uint	EnabledBitmask;
+};
+
+static const uint CandidateClusterSize = 8u;
+
+uint GetCandidateNodeSize(bool bHasEnabledMask)
+{
+	return bHasEnabledMask ? 12u : 8u;
+}
+
+uint GetMaxCandidateClusterBatches() { return MaxCandidateClusters / PERSISTENT_CLUSTER_CULLING_GROUP_SIZE; }
+
+// CandidateNodesAndClusters layout:
+// Culling batch counts, Candidate clusters, Candidate nodes
+uint GetCullingBatchesOffset() { return 0u; }
+uint GetCandidateClustersOffset() { return GetMaxCandidateClusterBatches() * 4u; }
+uint GetCandidateNodesOffset() { return GetCandidateClustersOffset() + MaxCandidateClusters * CandidateClusterSize; }
+
+void ClearCandidateCluster(RWByteAddressBuffer CandidateNodesAndClusters, uint ClusterIndex)
+{
+	CandidateNodesAndClusters.Store(GetCandidateClustersOffset() + ClusterIndex * CandidateClusterSize, 0xFFFFFFFFu);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+void ClearCandidateClusterCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint ClusterIndex)
+{
+	CandidateNodesAndClusters.Store(GetCandidateClustersOffset() + ClusterIndex * CandidateClusterSize, 0xFFFFFFFFu);
+}
+
+void StoreCandidateCluster(RWByteAddressBuffer CandidateNodesAndClusters, uint ClusterIndex, FVisibleCluster VisibleCluster)
+{
+	uint4 RawData = PackVisibleCluster(ClusterIndex, VisibleCluster, false);
+	CandidateNodesAndClusters.Store2(GetCandidateClustersOffset() + ClusterIndex * CandidateClusterSize, RawData.xy);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+void StoreCandidateClusterCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint ClusterIndex, FVisibleCluster VisibleCluster)
+{
+	uint4 RawData = PackVisibleCluster(ClusterIndex, VisibleCluster, false);
+	CandidateNodesAndClusters.Store2(GetCandidateClustersOffset() + ClusterIndex * CandidateClusterSize, RawData.xy);
+}
+
+void StoreVisibleCluster(RWByteAddressBuffer VisibleClusters, uint ClusterIdx, FVisibleCluster VisibleCluster, bool bHasPageData = false)
+{
+	uint4 RawData = PackVisibleCluster(ClusterIdx, VisibleCluster, bHasPageData);
+	if (bHasPageData)
+	{
+		VisibleClusters.Store3(ClusterIdx * 12, RawData.xyz);
+	}
+	else
+	{
+		VisibleClusters.Store2(ClusterIdx * 8, RawData.xy);
+	}
+}
+
+uint4 PackCandidateNode(FCandidateNode Node)
+{
+	// Leave at least one bit unused in each of the fields, so 0xFFFFFFFFu is never a valid value. Checked in C++ code.
+	uint4 RawData;
+	RawData.x = (Node.InstanceId << NUM_CULLING_FLAG_BITS) | Node.Flags;
+	RawData.y = (Node.ViewId << MAX_NODES_PER_PRIMITIVE_BITS) | Node.NodeIndex;
+	RawData.z = Node.EnabledBitmask;
+	RawData.w = 0;
+	return RawData;
+}
+
+FCandidateNode UnpackCandidateNode(uint4 RawData, bool bHasEnabledMask)
+{
+	FCandidateNode Node;
+	Node.Flags			= BitFieldExtractU32(RawData.x, NUM_CULLING_FLAG_BITS, 0);
+	Node.InstanceId		= BitFieldExtractU32(RawData.x, MAX_INSTANCES_BITS, NUM_CULLING_FLAG_BITS);
+	Node.NodeIndex		= BitFieldExtractU32(RawData.y, MAX_NODES_PER_PRIMITIVE_BITS, 0);
+	Node.ViewId			= BitFieldExtractU32(RawData.y, MAX_VIEWS_PER_CULL_RASTERIZE_PASS_BITS, MAX_NODES_PER_PRIMITIVE_BITS);
+	Node.EnabledBitmask = bHasEnabledMask ? RawData.z : 0xFFFFFFFFu;
+	return Node;
+}
+
+bool IsNodeDataReady(uint4 RawData, bool bHasEnabledMask)
+{
+	return RawData.x != 0xFFFFFFFFu && RawData.y != 0xFFFFFFFFu && (!bHasEnabledMask || RawData.z != 0xFFFFFFFFu);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+uint4 LoadCandidateNodeDataCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, bool bHasEnabledMask)
+{
+	return bHasEnabledMask ?	uint4(CandidateNodesAndClusters.Load3(GetCandidateNodesOffset() + NodeIndex * 12), 0) :
+								uint4(CandidateNodesAndClusters.Load2(GetCandidateNodesOffset() + NodeIndex * 8), 0, 0);
+}
+
+void StoreCandidateNodeData(RWByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, uint4 RawData, bool bHasEnabledMask)
+{
+	if (bHasEnabledMask)
+		CandidateNodesAndClusters.Store3(GetCandidateNodesOffset() + NodeIndex * 12, RawData.xyz);
+	else
+		CandidateNodesAndClusters.Store2(GetCandidateNodesOffset() + NodeIndex * 8, RawData.xy);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+void StoreCandidateNodeDataCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, uint4 RawData, bool bHasEnabledMask)
+{
+	if (bHasEnabledMask)
+		CandidateNodesAndClusters.Store3(GetCandidateNodesOffset() + NodeIndex * 12, RawData.xyz);
+	else
+		CandidateNodesAndClusters.Store2(GetCandidateNodesOffset() + NodeIndex * 8, RawData.xy);
+}
+
+void StoreCandidateNode(RWByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, FCandidateNode Node, bool bHasEnabledMask)
+{
+	StoreCandidateNodeData(CandidateNodesAndClusters, NodeIndex, PackCandidateNode(Node), bHasEnabledMask);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+void StoreCandidateNodeCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, FCandidateNode Node, bool bHasEnabledMask)
+{
+	StoreCandidateNodeDataCoherent(CandidateNodesAndClusters, NodeIndex, PackCandidateNode(Node), bHasEnabledMask);
+}
+
+void ClearCandidateNode(RWByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, bool bHasEnabledMask)
+{
+	StoreCandidateNodeData(CandidateNodesAndClusters, NodeIndex, 0xFFFFFFFFu, bHasEnabledMask);
+}
+
+// CandidateNodesAndClusters must be globallycoherent here, otherwise DXC will make buffer access non-globallycoherent when targeting SM6.6.
+void ClearCandidateNodeCoherent(globallycoherent RWCoherentByteAddressBuffer CandidateNodesAndClusters, uint NodeIndex, bool bHasEnabledMask)
+{
+	StoreCandidateNodeDataCoherent(CandidateNodesAndClusters, NodeIndex, 0xFFFFFFFFu, bHasEnabledMask);
+}

@@ -1,0 +1,200 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// TODO: Remove hair dependency
+#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../SceneTextureParameters.ush"
+#include "../VelocityCommon.ush"
+
+#include "LumenCardCommon.ush"
+#include "LumenTracingCommon.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenHardwareRayTracingCommon.ush"
+
+#ifndef DIM_DEFERRED_MATERIAL_MODE
+#define DIM_DEFERRED_MATERIAL_MODE 0
+#endif 
+
+#ifndef DIM_LIGHTING_MODE
+#define DIM_LIGHTING_MODE LIGHTING_FROM_SURFACE_CACHE
+#endif
+
+RWTexture2D<float> RWTraceHit;
+RWTexture2D<float3> RWRadiance;
+
+RaytracingAccelerationStructure TLAS;
+StructuredBuffer<FDeferredMaterialPayload> DeferredMaterialBuffer;
+
+int LightingMode;
+int MaxTranslucentSkipCount;
+int bIsDeferredMaterial;
+int VisualizeHiResSurface;
+float MaxTraceDistance;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenVisualizeHardwareRayTracingRGS)
+{
+	uint2 TraceCoord = 0;
+	FDeferredMaterialPayload DeferredMaterialPayload;
+	if (DIM_DEFERRED_MATERIAL_MODE)
+	{
+		DeferredMaterialPayload = DeferredMaterialBuffer[DispatchRaysIndex().x];
+		TraceCoord.x = DeferredMaterialPayload.PixelCoordinates & 0xFFFF;
+		TraceCoord.y = DeferredMaterialPayload.PixelCoordinates >> 16;
+
+		if (DeferredMaterialPayload.SortKey == RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID)
+		{
+			RWRadiance[TraceCoord] = 0;
+			return;
+		}
+	}
+	else
+	{
+		TraceCoord = View.ViewRectMin.xy + DispatchRaysIndex().xy;
+	}
+
+	// Viewport guard
+	if (all(TraceCoord < View.BufferSizeAndInvSize.xy))
+	{
+		float2 ScreenUV = (TraceCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+		RayDesc Ray = CreatePrimaryRay(ScreenUV);
+		Ray.TMax = min(Ray.TMax, MaxTraceDistance);
+
+		FRayCone RayCone = (FRayCone)0;
+		RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+		int LinearCoord = TraceCoord.y * View.BufferSizeAndInvSize.x + TraceCoord.x;
+
+		const bool bCullBackFacingTriangles = true;
+		const bool bHiResSurface = VisualizeHiResSurface != 0 ? true : false;
+
+		FRayTracedLightingContext Context = CreateRayTracedLightingContext(
+			TLAS,
+			RayCone,
+			TraceCoord,
+			LinearCoord,
+			bCullBackFacingTriangles,
+			MaxTranslucentSkipCount,
+			bHiResSurface);
+
+		bool bTraceRay = true;
+		if (DIM_DEFERRED_MATERIAL_MODE)
+		{
+			// Clip 
+			bTraceRay = DeferredMaterialPayload.SortKey < RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS;
+			if (bTraceRay)
+			{
+				float Epsilon = 0.5;
+				Ray.TMin = max(0, DeferredMaterialPayload.HitT - Epsilon);
+				// Note: adjusting TMax will not properly account for masked materials because of restricted any-hit length
+				Ray.TMax = DeferredMaterialPayload.HitT + Epsilon;
+			}
+		}
+
+		bool bHit = false;
+		float3 Radiance = 0;
+		if (bTraceRay)
+		{
+			float HitDistance;
+			bool bUseMinimalPayload = (DIM_LIGHTING_MODE == LIGHTING_FROM_SURFACE_CACHE) && (DIM_DEFERRED_MATERIAL_MODE == 0);
+			if (bUseMinimalPayload)
+			{
+				FLumenMinimalPayload Payload = (FLumenMinimalPayload)0;
+				bHit = TraceLumenMinimalRay(Ray, Context, Payload);
+
+				int TranslucentSkipCount = 0;
+				while (bHit && Payload.IsTranslucent() && TranslucentSkipCount < Context.TranslucentSkipCountMax)
+				{
+					float Epsilon = 0.01;
+					Ray.TMin = Payload.HitT + Epsilon;
+					bHit = TraceLumenMinimalRay(Ray, Context, Payload);
+					TranslucentSkipCount++;
+				}
+
+				if (bHit)
+				{
+					float3 WorldPosition = Ray.Origin + Ray.Direction * Payload.HitT;
+
+					if (VisualizeMode == VISUALIZE_MODE_LOCAL_POSITION)
+					{
+						uint GPUSceneInstanceIndex = GetGPUSceneInstanceIndex(Payload.GetPrimitiveIndex(), Payload.GetInstanceIndex());
+						float3 LocalPosition = CalcLocalPositionFromGPUSceneInstanceIndex(WorldPosition, GPUSceneInstanceIndex);
+						// Debug: Modify visualization remapping here
+						LocalPosition = frac(LocalPosition * 0.001);
+						Radiance = abs(LocalPosition);
+						Radiance *= View.OneOverPreExposure;
+					}
+					else if (VisualizeMode == VISUALIZE_MODE_VELOCITY)
+					{
+						uint GPUSceneInstanceIndex = GetGPUSceneInstanceIndex(Payload.GetPrimitiveIndex(), Payload.GetInstanceIndex());
+						//float3 WorldVelocity = CalcVelocityFromGPUSceneInstanceIndex(WorldPosition, GPUSceneInstanceIndex);
+						float3 PrevWorldPosition = CalcPrevWorldPositionFromGPUSceneInstanceIndex(WorldPosition, GPUSceneInstanceIndex);
+
+						float4 ScreenPosition = mul(float4(WorldPosition, 1.0), View.WorldToClip);
+						float4 PrevScreenPosition = mul(float4(PrevWorldPosition, 1.0), View.WorldToClip);
+						float3 ScreenVelocity = Calculate3DVelocity(ScreenPosition, PrevScreenPosition);
+						Radiance = EncodeVelocityToTexture(ScreenVelocity).xyz;
+						Radiance *= View.OneOverPreExposure;
+					}
+					else // Visualize surface-cache property
+					{
+						uint GPUSceneInstanceIndex = GetGPUSceneInstanceIndex(Payload.GetPrimitiveIndex(), Payload.GetInstanceIndex());
+						Radiance = CalculateRayTracedLightingFromSurfaceCache(Ray, Context, Payload, Payload.HitT, GPUSceneInstanceIndex);
+					}
+				}
+			}
+			else
+			{
+				bHit = TraceAndCalculateRayTracedLighting(Ray, Context, DIM_LIGHTING_MODE, HitDistance, Radiance);
+			}
+		}
+
+		// Apply SkyLight when visualizing final lighting
+		if (!bHit && VisualizeMode == 0)
+		{
+			FConeTraceResult TraceResult = (FConeTraceResult)0;
+			TraceResult.Transparency = 1;
+			EvaluateSkyRadianceForCone(Ray.Direction, 0.0f, TraceResult);
+			Radiance = TraceResult.Lighting;
+		}
+
+		Radiance *= View.PreExposure;
+		RWRadiance[TraceCoord] = Radiance;
+	}
+}
+
+RWStructuredBuffer<FDeferredMaterialPayload> RWDeferredMaterialBuffer;
+int2 DeferredMaterialBufferResolution;
+uint TileSize;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenVisualizeHardwareRayTracingDeferredMaterialRGS)
+{
+	uint2 TraceCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint LinearCoord = TraceCoord.y * View.BufferSizeAndInvSize.x + TraceCoord.x;
+
+	FDeferredMaterialPayload DeferredMaterialPayload = (FDeferredMaterialPayload)0;
+	DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID;
+	if (all(TraceCoord < View.BufferSizeAndInvSize.xy))
+	{
+		float2 ScreenUV = (TraceCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+		RayDesc Ray = CreatePrimaryRay(ScreenUV);
+
+		FRayCone RayCone = (FRayCone)0;
+		RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+
+		const bool bCullBackFacingTriangles = true;
+		FRayTracedLightingContext Context = CreateRayTracedLightingContext(TLAS, RayCone, TraceCoord, LinearCoord, bCullBackFacingTriangles);
+		TraceDeferredMaterialRay(Ray, Context, DeferredMaterialPayload);
+	}
+
+	// Rearrange in tiled blocks to extract spatial coherence
+	uint2 BlockCoord = TraceCoord / TileSize;
+	uint BlocksPerRow = DeferredMaterialBufferResolution.x / TileSize;
+	uint BlockIndex = BlockCoord.y * BlocksPerRow + BlockCoord.x;
+	uint2 TileCoord = TraceCoord % TileSize;
+	uint TileIndex = TileCoord.y * TileSize + TileCoord.x;
+	uint BlockSize = TileSize * TileSize;
+	uint DeferredMaterialBufferIndex = BlockIndex * BlockSize + TileIndex;
+
+	RWDeferredMaterialBuffer[DeferredMaterialBufferIndex] = DeferredMaterialPayload;
+}

@@ -1,0 +1,1275 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+
+#include "EdModeInteractiveToolsContext.h"
+
+#include "BaseGizmos/GizmoViewContext.h"
+#include "ContextObjectStore.h"
+#include "Editor.h"
+#include "EditorViewportClient.h"
+#include "EditorModeManager.h"
+#include "LevelEditor.h"
+#include "LevelEditorViewport.h"
+#include "IAssetViewport.h"
+#include "Math/Rotator.h"
+#include "Misc/AssertionMacros.h"
+#include "SLevelViewport.h"
+
+#include "Modules/ModuleManager.h"
+#include "ShowFlags.h"				// for EngineShowFlags
+#include "Engine/Engine.h"
+#include "Engine/Selection.h"
+#include "Misc/ITransaction.h"
+#include "ScopedTransaction.h"
+#include "Materials/Material.h"
+#include "Engine/StaticMesh.h"
+#include "Components/StaticMeshComponent.h"
+
+#include "ToolContextInterfaces.h"
+#include "InteractiveToolObjects.h"
+#include "InteractiveToolsSelectionStoreSubsystem.h"
+#include "EditorInteractiveGizmoManager.h"
+#include "BaseBehaviors/ClickDragBehavior.h"
+#include "EditorModeManager.h"
+#include "EdMode.h"
+
+#include "BaseGizmos/GizmoRenderingUtil.h"
+#include "UnrealClient.h"
+#include "UObject/ObjectSaveContext.h"
+
+//#define ENABLE_DEBUG_PRINTING
+
+static float SnapToIncrement(float fValue, float fIncrement, float offset = 0)
+{
+	if (!FMath::IsFinite(fValue))
+	{
+		return 0;
+	}
+	fValue -= offset;
+	float sign = FMath::Sign(fValue);
+	fValue = FMath::Abs(fValue);
+	int nInc = (int)(fValue / fIncrement);
+	float fRem = (float)fmod(fValue, fIncrement);
+	if (fRem > fIncrement / 2)
+	{
+		++nInc;
+	}
+	return sign * (float)nInc * fIncrement + offset;
+}
+
+
+
+
+static bool IsVisibleObjectHit_Internal(const FHitResult& HitResult)
+{
+	AActor* Actor = HitResult.GetActor();
+	if (Actor != nullptr && (Actor->IsHidden() || Actor->IsHiddenEd()) )
+	{
+		return false;
+	}
+	UPrimitiveComponent* Component = HitResult.GetComponent();
+	if (Component != nullptr && (Component->IsVisible() == false && Component->IsVisibleInEditor() == false))
+	{
+		return false;
+	}
+	return true;
+}
+
+static bool FindNearestVisibleObjectHit_Internal(UWorld* World, FHitResult& HitResultOut, const FVector& Start, const FVector& End,
+	bool bIsSceneGeometrySnapQuery, const TArray<const UPrimitiveComponent*>* ComponentsToIgnore, 
+	const TArray<const UPrimitiveComponent*>* InvisibleComponentsToInclude)
+{
+	FCollisionObjectQueryParams ObjectQueryParams(FCollisionObjectQueryParams::AllObjects);
+	FCollisionQueryParams QueryParams = FCollisionQueryParams::DefaultQueryParam;
+	QueryParams.bTraceComplex = true;
+	QueryParams.bReturnFaceIndex = bIsSceneGeometrySnapQuery;
+
+	TArray<FHitResult> OutHits;
+	if (World->LineTraceMultiByObjectType(OutHits, Start, End, ObjectQueryParams, QueryParams) == false)
+	{
+		return false;
+	}
+
+	float NearestVisible = TNumericLimits<float>::Max();
+	for (const FHitResult& CurResult : OutHits)
+	{
+		if (CurResult.Distance < NearestVisible)
+		{
+			if (IsVisibleObjectHit_Internal(CurResult) 
+				|| (InvisibleComponentsToInclude && InvisibleComponentsToInclude->Contains(CurResult.GetComponent())))
+			{
+				if (!ComponentsToIgnore || !ComponentsToIgnore->Contains(CurResult.GetComponent()))
+				{
+					HitResultOut = CurResult;
+					NearestVisible = CurResult.Distance;
+				}
+			}
+		}
+	}
+
+	return NearestVisible < TNumericLimits<float>::Max();
+}
+
+
+
+
+
+
+class FEdModeToolsContextQueriesImpl : public IToolsContextQueriesAPI
+{
+public:
+	UEdModeInteractiveToolsContext* ToolsContext;
+	FEditorModeTools* EditorModeManager;
+
+	FViewCameraState CachedViewState;
+	FEditorViewportClient* CachedViewportClient;
+
+	FEdModeToolsContextQueriesImpl(UEdModeInteractiveToolsContext* Context, FEditorModeTools* InEditorModeManager)
+	{
+		ToolsContext = Context;
+		EditorModeManager = InEditorModeManager;
+	}
+
+	void CacheCurrentViewState(FEditorViewportClient* ViewportClient)
+	{
+		CachedViewportClient = ViewportClient;
+		FViewportCameraTransform ViewTransform = ViewportClient->GetViewTransform();
+		CachedViewState.bIsOrthographic = ViewportClient->IsOrtho();
+		CachedViewState.Position = ViewTransform.GetLocation();
+		CachedViewState.HorizontalFOVDegrees = ViewportClient->ViewFOV;
+		CachedViewState.AspectRatio = ViewportClient->AspectRatio;
+
+		// ViewTransform rotation is only initialized for perspective!
+		if (CachedViewState.bIsOrthographic == false)
+		{
+			// if using Orbit camera, the rotation in the ViewTransform is not the current camera rotation, it
+			// is set to a different rotation based on the Orbit. So we have to convert back to camera rotation.
+			FRotator ViewRotation = (ViewportClient->bUsingOrbitCamera) ? 
+				ViewTransform.ComputeOrbitMatrix().InverseFast().Rotator()  :   ViewTransform.GetRotation();
+
+			CachedViewState.Orientation = ViewRotation.Quaternion();
+		}
+		else
+		{
+			// These rotations are based on hardcoded values in EditorViewportClient.cpp, see switches in FEditorViewportClient::CalcSceneView and FEditorViewportClient::Draw
+			switch (ViewportClient->ViewportType)
+			{
+			case LVT_OrthoXY:
+				CachedViewState.Orientation = FQuat(FRotator(-90.0f, -90.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeXY:
+				CachedViewState.Orientation = FQuat(FRotator(90.0f, 90.0f, 0.0f));
+				break;
+			case LVT_OrthoXZ:
+				CachedViewState.Orientation = FQuat(FRotator(0.0f, -90.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeXZ:
+				CachedViewState.Orientation = FQuat(FRotator(0.0f, 90.0f, 0.0f));
+				break;
+			case LVT_OrthoYZ:
+				CachedViewState.Orientation = FQuat(FRotator(0.0f, 0.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeYZ:
+				CachedViewState.Orientation = FQuat(FRotator(0.0f, 180.0f, 0.0f));
+				break;
+			default:
+				CachedViewState.Orientation = FQuat::Identity;
+			}
+
+			CachedViewState.OrthoWorldCoordinateWidth = ViewportClient->GetOrthoUnitsPerPixel(ViewportClient->Viewport) * ViewportClient->Viewport->GetSizeXY().X;
+		}
+
+		CachedViewState.bIsVR = false;
+	}
+
+	virtual void GetCurrentSelectionState(FToolBuilderState& StateOut) const override
+	{
+		StateOut.ToolManager = ToolsContext->ToolManager;
+		StateOut.TargetManager = ToolsContext->TargetManager;
+		StateOut.GizmoManager = ToolsContext->GizmoManager;
+		StateOut.World = EditorModeManager->GetWorld();
+		EditorModeManager->GetSelectedActors()->GetSelectedObjects(StateOut.SelectedActors);
+		EditorModeManager->GetSelectedComponents()->GetSelectedObjects(StateOut.SelectedComponents);
+		StateOut.TypedElementSelectionSet = EditorModeManager->GetEditorSelectionSet();
+
+		UInteractiveToolsSelectionStoreSubsystem* ToolSelectionStore = GEngine->GetEngineSubsystem<UInteractiveToolsSelectionStoreSubsystem>();
+		ensureMsgf(ToolSelectionStore, TEXT("UInteractiveToolsSelectionStoreSubsystem was null, so tool selections will not be loaded. "
+			"Was the owning module loaded?"));
+
+		// If we someday have tool selections be tool manager specific, we can pass in the tool manager
+		// as a parameter here.
+		StateOut.StoredToolSelection = 
+			(ToolSelectionStore ? ToolSelectionStore->GetStoredSelection() : nullptr);
+	}
+
+	virtual void GetCurrentViewState(FViewCameraState& StateOut) const override
+	{
+		StateOut = CachedViewState;
+	}
+
+	virtual EToolContextCoordinateSystem GetCurrentCoordinateSystem() const override
+	{
+		ECoordSystem CoordSys = EditorModeManager->GetCoordSystem();
+		return (CoordSys == COORD_World) ? EToolContextCoordinateSystem::World : EToolContextCoordinateSystem::Local;
+	}
+
+	bool ExecuteSceneSnapQueryRotation(const FSceneSnapQueryRequest& Request, TArray<FSceneSnapQueryResult>& Results) const
+	{
+		if ((Request.TargetTypes & ESceneSnapQueryTargetType::Grid) != ESceneSnapQueryTargetType::None)
+		{
+			FRotator Rotator ( Request.DeltaRotation );
+			FRotator RotGrid = Request.RotGridSize.Get(GEditor->GetRotGridSize());
+			Rotator = Rotator.GridSnap( RotGrid );
+
+			FSceneSnapQueryResult SnapResult;
+			SnapResult.TargetType = ESceneSnapQueryTargetType::Grid;
+			SnapResult.DeltaRotation = Rotator.Quaternion();
+			Results.Add(SnapResult);
+			return true;
+		}
+		return false;
+	}
+
+	bool ExecuteSceneSnapQueryPosition(const FSceneSnapQueryRequest& Request, TArray<FSceneSnapQueryResult>& Results) const
+	{
+		int FoundResultCount = 0;
+
+		if ((Request.TargetTypes & ESceneSnapQueryTargetType::Grid) != ESceneSnapQueryTargetType::None)
+		{
+			FSceneSnapQueryResult SnapResult;
+			SnapResult.TargetType = ESceneSnapQueryTargetType::Grid;
+
+			float SnapSize = GEditor->GetGridSize();
+			FVector GridSize = Request.GridSize.Get(FVector(SnapSize, SnapSize, SnapSize));
+
+			SnapResult.Position.X = SnapToIncrement(Request.Position.X, GridSize.X);
+			SnapResult.Position.Y = SnapToIncrement(Request.Position.Y, GridSize.Y);
+			SnapResult.Position.Z = SnapToIncrement(Request.Position.Z, GridSize.Z);
+
+			Results.Add(SnapResult);
+			FoundResultCount++;
+		}
+
+		//
+		// Run a snap query by casting ray into the world.
+		// If a hit is found, we look up what triangle was hit, and then test its vertices and edges
+		//
+
+		// cast ray into world
+		FVector RayStart = CachedViewState.Position;
+		FVector RayDirection = Request.Position - RayStart; RayDirection.Normalize();
+		FVector RayEnd = RayStart + HALF_WORLD_MAX * RayDirection;
+		FHitResult HitResult;
+		bool bHitWorld = FindNearestVisibleObjectHit_Internal(EditorModeManager->GetWorld(), HitResult, 
+			RayStart, RayEnd, true, Request.ComponentsToIgnore, Request.InvisibleComponentsToInclude);
+		if (bHitWorld && HitResult.FaceIndex >= 0)
+		{
+			float VisualAngle = OpeningAngleDeg(Request.Position, HitResult.ImpactPoint, RayStart);
+			//UE_LOG(LogTemp, Warning, TEXT("[HIT] visualangle %f faceindex %d"), VisualAngle, HitResult.FaceIndex);
+			if (VisualAngle < Request.VisualAngleThresholdDegrees)
+			{
+				UPrimitiveComponent* Component = HitResult.Component.Get();
+				if (Cast<UStaticMeshComponent>(Component) != nullptr)
+				{
+					// HitResult.FaceIndex is apparently an index into the TriMeshCollisionData, not sure how
+					// to directly access it. Calling GetPhysicsTriMeshData is expensive!
+					//UBodySetup* BodySetup = Cast<UStaticMeshComponent>(Component)->GetBodySetup();
+					//UObject* CDPObj = BodySetup->GetOuter();
+					//IInterface_CollisionDataProvider* CDP = Cast<IInterface_CollisionDataProvider>(CDPObj);
+					//FTriMeshCollisionData TriMesh;
+					//CDP->GetPhysicsTriMeshData(&TriMesh, true);
+					//FTriIndices Triangle = TriMesh.Indices[HitResult.FaceIndex];
+					//FVector Positions[3] = { TriMesh.Vertices[Triangle.v0], TriMesh.Vertices[Triangle.v1], TriMesh.Vertices[Triangle.v2] };
+
+					// physics collision data is created from StaticMesh RenderData
+					// so use HitResult.FaceIndex to extract triangle from the LOD0 mesh
+					// (note: this may be incorrect if there are multiple sections...in that case I think we have to
+					//  first find section whose accumulated index range would contain .FaceIndexX)
+					UStaticMesh* StaticMesh = Cast<UStaticMeshComponent>(Component)->GetStaticMesh();
+					FStaticMeshLODResources& LOD = StaticMesh->GetRenderData()->LODResources[0];
+					FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
+					int32 TriIdx = 3 * HitResult.FaceIndex;
+					FVector Positions[3];
+					Positions[0] = LOD.VertexBuffers.PositionVertexBuffer.VertexPosition(Indices[TriIdx]);
+					Positions[1] = LOD.VertexBuffers.PositionVertexBuffer.VertexPosition(Indices[TriIdx+1]);
+					Positions[2] = LOD.VertexBuffers.PositionVertexBuffer.VertexPosition(Indices[TriIdx+2]);
+
+					// transform to world space
+					FTransform ComponentTransform = Component->GetComponentTransform();
+					Positions[0] = ComponentTransform.TransformPosition(Positions[0]);
+					Positions[1] = ComponentTransform.TransformPosition(Positions[1]);
+					Positions[2] = ComponentTransform.TransformPosition(Positions[2]);
+
+					FSceneSnapQueryResult SnapResult;
+					SnapResult.TriVertices[0] = Positions[0];
+					SnapResult.TriVertices[1] = Positions[1];
+					SnapResult.TriVertices[2] = Positions[2];
+
+					// try snapping to vertices
+					float SmallestAngle = Request.VisualAngleThresholdDegrees;
+					if ( (Request.TargetTypes & ESceneSnapQueryTargetType::MeshVertex) != ESceneSnapQueryTargetType::None)
+					{
+						for (int j = 0; j < 3; ++j)
+						{
+							VisualAngle = OpeningAngleDeg(Request.Position, Positions[j], RayStart);
+							if (VisualAngle < SmallestAngle)
+							{
+								SmallestAngle = VisualAngle;
+								SnapResult.Position = Positions[j];
+								SnapResult.TargetType = ESceneSnapQueryTargetType::MeshVertex;
+								SnapResult.TriSnapIndex = j;
+							}
+						}
+					}
+
+					// try snapping to nearest points on edges
+					if ( ((Request.TargetTypes & ESceneSnapQueryTargetType::MeshEdge) != ESceneSnapQueryTargetType::None) &&
+						 (SnapResult.TargetType != ESceneSnapQueryTargetType::MeshVertex) )
+					{
+						for (int j = 0; j < 3; ++j)
+						{
+							FVector EdgeNearestPt = NearestSegmentPt(Positions[j], Positions[(j+1)%3], Request.Position);
+							VisualAngle = OpeningAngleDeg(Request.Position, EdgeNearestPt, RayStart);
+							if (VisualAngle < SmallestAngle )
+							{
+								SmallestAngle = VisualAngle;
+								SnapResult.Position = EdgeNearestPt;
+								SnapResult.TargetType = ESceneSnapQueryTargetType::MeshEdge;
+								SnapResult.TriSnapIndex = j;
+							}
+						}
+					}
+
+					// if we found a valid snap, return it
+					if (SmallestAngle < Request.VisualAngleThresholdDegrees)
+					{
+						SnapResult.TargetActor = HitResult.HitObjectHandle.FetchActor();
+						SnapResult.TargetComponent = HitResult.Component.Get();
+						Results.Add(SnapResult);
+						FoundResultCount++;
+					}
+				}
+			}
+
+		}
+
+		return (FoundResultCount > 0);
+	}
+
+	virtual bool ExecuteSceneSnapQuery(const FSceneSnapQueryRequest& Request, TArray<FSceneSnapQueryResult>& Results) const override
+	{
+		switch (Request.RequestType)
+		{
+		case ESceneSnapQueryType::Position:
+			return ExecuteSceneSnapQueryPosition(Request, Results);
+			break;
+		case ESceneSnapQueryType::Rotation:
+			return ExecuteSceneSnapQueryRotation(Request, Results);
+			break;
+		default:
+			check(!"Only Position and Rotation Snap Queries are supported");
+		}
+		return false;
+	}
+
+	//@ todo this are mirrored from GeometryProcessing, which is still experimental...replace w/ direct calls once GP component is standardized
+	static float OpeningAngleDeg(FVector A, FVector B, const FVector& P)
+	{
+		A -= P;
+		A.Normalize();
+		B -= P;
+		B.Normalize();
+		float Dot = FMath::Clamp(FVector::DotProduct(A,B), -1.0f, 1.0f);
+		return acos(Dot) * (180.0f / 3.141592653589f);
+	}
+
+	static FVector NearestSegmentPt(FVector A, FVector B, const FVector& P)
+	{
+		FVector Direction = (B - A);
+		float Length = Direction.Size();
+		Direction /= Length;
+		float t = FVector::DotProduct( (P - A), Direction);
+		if (t >= Length)
+		{
+			return B;
+		}
+		if (t <= 0)
+		{
+			return A;
+		}
+		return A + t * Direction;
+	}
+
+	virtual UMaterialInterface* GetStandardMaterial(EStandardToolContextMaterials MaterialType) const
+	{
+		if (MaterialType == EStandardToolContextMaterials::VertexColorMaterial)
+		{
+			return ToolsContext->StandardVertexColorMaterial;
+		}
+		check(false);
+		return nullptr;
+	}
+
+	virtual FViewport* GetHoveredViewport() const override
+	{
+		if (FEditorViewportClient* HoveredClient = EditorModeManager->GetHoveredViewportClient())
+		{
+			return HoveredClient->Viewport;
+		}
+
+		return nullptr;
+	}
+
+	virtual FViewport* GetFocusedViewport() const override
+	{
+		if (FEditorViewportClient* FocusedClient = EditorModeManager->GetFocusedViewportClient())
+		{
+			return FocusedClient->Viewport;
+		}
+
+		return nullptr;
+	}
+};
+
+class FEdModeToolsContextTransactionImpl : public IToolsContextTransactionsAPI
+{
+public:
+	FEdModeToolsContextTransactionImpl(UEdModeInteractiveToolsContext* Context, FEditorModeTools* InEditorModeManager)
+		: ToolsContext(Context)
+		, EditorModeManager(InEditorModeManager)
+	{
+		check(EditorModeManager);
+		check(ToolsContext);
+	}
+
+
+	virtual void DisplayMessage(const FText& Message, EToolMessageLevel Level) override
+	{
+		if (Level == EToolMessageLevel::UserNotification || Level == EToolMessageLevel::UserMessage)
+		{
+			ToolsContext->PostToolNotificationMessage(Message);
+		}
+		else if (Level == EToolMessageLevel::UserWarning || Level == EToolMessageLevel::UserError)
+		{
+			ToolsContext->PostToolWarningMessage(Message);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("%s"), *Message.ToString());
+		}
+	}
+
+
+	virtual void PostInvalidation() override
+	{
+		ToolsContext->PostInvalidation();
+	}
+
+	virtual void BeginUndoTransaction(const FText& Description) override
+	{
+		GEditor->BeginTransaction(Description);
+	}
+
+	virtual void EndUndoTransaction() override
+	{
+		GEditor->EndTransaction();
+	}
+
+	virtual void AppendChange(UObject* TargetObject, TUniquePtr<FToolCommandChange> Change, const FText& Description) override
+	{
+		FScopedTransaction Transaction(Description);
+		check(GUndo != nullptr);
+		GUndo->StoreUndo(TargetObject, MoveTemp(Change));
+		// end transaction
+	}
+
+
+	virtual bool RequestSelectionChange(const FSelectedOjectsChangeList& SelectionChange) override
+	{
+		checkf(SelectionChange.Components.Num() == 0, TEXT("FEdModeToolsContextTransactionImpl::RequestSelectionChange - Component selection not supported yet"));
+
+		if (SelectionChange.ModificationType == ESelectedObjectsModificationType::Clear)
+		{
+			GEditor->SelectNone(true, true, false);
+			return true;
+		}
+
+		if (SelectionChange.ModificationType == ESelectedObjectsModificationType::Replace )
+		{
+			GEditor->SelectNone(false, true, false);
+		}
+
+		bool bAdd = (SelectionChange.ModificationType != ESelectedObjectsModificationType::Remove);
+		int NumActors = SelectionChange.Actors.Num();
+		for (int k = 0; k < NumActors; ++k)
+		{
+			GEditor->SelectActor(SelectionChange.Actors[k], bAdd, false, true, false);
+		}
+
+		GEditor->NoteSelectionChange(true);
+		return true;
+	}
+
+	virtual bool RequestToolSelectionStore(const UInteractiveToolStorableSelection* StorableSelection,
+		const FToolSelectionStoreParams & = FToolSelectionStoreParams()) override
+	{
+		if (UInteractiveToolsSelectionStoreSubsystem* ToolSelectionStore = GEngine->GetEngineSubsystem<UInteractiveToolsSelectionStoreSubsystem>())
+		{
+			ToolSelectionStore->Modify(false); // Allows this to be part of an undo transaction if one is open.
+			ToolSelectionStore->SetStoredSelection(StorableSelection);
+			return true;
+		}
+
+		ensureMsgf(false, TEXT("UInteractiveToolsSelectionStoreSubsystem was null, so tool selections will not be stored. "
+			"Was the owning module loaded?"));
+		return false;
+	}
+
+protected:
+	UEdModeInteractiveToolsContext* ToolsContext;
+	FEditorModeTools* EditorModeManager;
+};
+
+
+
+
+UEdModeInteractiveToolsContext::UEdModeInteractiveToolsContext()
+{
+	QueriesAPI = nullptr;
+	TransactionAPI = nullptr;
+}
+
+
+
+void UEdModeInteractiveToolsContext::Initialize(IToolsContextQueriesAPI* QueriesAPIIn, IToolsContextTransactionsAPI* TransactionsAPIIn)
+{
+	UInteractiveToolsContext::Initialize(QueriesAPIIn, TransactionsAPIIn);
+
+	BeginPIEDelegateHandle = FEditorDelegates::BeginPIE.AddLambda([this](bool bSimulating)
+	{
+		TerminateActiveToolsOnPIEStart();
+	});
+	PreSaveWorldDelegateHandle = FEditorDelegates::PreSaveWorldWithContext.AddLambda([this](UWorld* World, FObjectPreSaveContext ObjectSaveContext)
+	{
+		TerminateActiveToolsOnSaveWorld();
+	});
+
+	FLevelEditorModule& LevelEditor = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
+	WorldTearDownDelegateHandle = LevelEditor.OnMapChanged().AddLambda([this](UWorld* World, EMapChangeType ChangeType)
+	{
+		if (ChangeType == EMapChangeType::TearDownWorld)
+		{
+			TerminateActiveToolsOnWorldTearDown();
+		}
+	});
+
+	ToolManager->OnToolEnded.AddUObject(this, &UEdModeInteractiveToolsContext::OnToolEnded);
+	ToolManager->OnToolPostBuild.AddUObject(this, &UEdModeInteractiveToolsContext::OnToolPostBuild);
+
+	// if viewport clients change we will discard our overrides as we aren't sure what happened
+	ViewportClientListChangedHandle = GEditor->OnViewportClientListChanged().AddLambda([this]()
+	{
+		RestoreEditorState();
+	});
+
+	InvalidationTimestamp = 0;
+
+	// This gets set up in UInteractiveToolsContext::Initialize;
+	GizmoViewContext = ToolManager->GetContextObjectStore()->FindContext<UGizmoViewContext>();
+}
+
+void UEdModeInteractiveToolsContext::Shutdown()
+{
+	if (ToolManager)
+	{
+		ToolManager->OnToolPostBuild.RemoveAll(this);
+		ToolManager->OnToolEnded.RemoveAll(this);
+	}
+
+	if (FLevelEditorModule* LevelEditor = FModuleManager::GetModulePtr<FLevelEditorModule>("LevelEditor"))
+	{
+		LevelEditor->OnMapChanged().Remove(WorldTearDownDelegateHandle);
+		FEditorDelegates::BeginPIE.Remove(BeginPIEDelegateHandle);
+		FEditorDelegates::PreSaveWorldWithContext.Remove(PreSaveWorldDelegateHandle);
+		GEditor->OnViewportClientListChanged().Remove(ViewportClientListChangedHandle);
+
+		// auto-accept any in-progress tools
+		DeactivateAllActiveTools(EToolShutdownType::Accept);
+
+		UInteractiveToolsContext::Shutdown();
+	}
+}
+
+void UEdModeInteractiveToolsContext::InitializeContextFromEdMode(FEdMode* EditorModeIn)
+{
+	check(EditorModeIn);
+	InitializeContextWithEditorModeManager(EditorModeIn->GetModeManager());
+}
+
+void UEdModeInteractiveToolsContext::InitializeContextWithEditorModeManager(FEditorModeTools* InEditorModeManager)
+{
+	check(InEditorModeManager);
+	EditorModeManager = InEditorModeManager;
+
+	this->TransactionAPI = new FEdModeToolsContextTransactionImpl(this, InEditorModeManager);
+	this->QueriesAPI = new FEdModeToolsContextQueriesImpl(this, InEditorModeManager);
+
+	SetCreateGizmoManagerFunc([this](const FContextInitInfo& ContextInfo)
+	{
+		UEditorInteractiveGizmoManager* NewGizmoManager = NewObject<UEditorInteractiveGizmoManager>(ContextInfo.ToolsContext);
+		NewGizmoManager->InitializeWithEditorModeManager(ContextInfo.QueriesAPI, ContextInfo.TransactionsAPI, ContextInfo.InputRouter, EditorModeManager);
+		NewGizmoManager->RegisterDefaultGizmos();
+		return NewGizmoManager;
+	});
+
+	Initialize(QueriesAPI, TransactionAPI);
+
+	// enable auto invalidation in Editor, because invalidating for all hover and capture events is unpleasant
+	this->InputRouter->bAutoInvalidateOnHover = true;
+	this->InputRouter->bAutoInvalidateOnCapture = true;
+
+	// set up standard materials
+	StandardVertexColorMaterial = GEngine->VertexColorMaterial;
+}
+
+
+void UEdModeInteractiveToolsContext::ShutdownContext()
+{
+	Shutdown();
+
+	OnToolNotificationMessage.Clear();
+	OnToolWarningMessage.Clear();
+
+	if (QueriesAPI != nullptr)
+	{
+		delete QueriesAPI;
+		QueriesAPI = nullptr;
+	}
+
+	if (TransactionAPI != nullptr)
+	{
+		delete TransactionAPI;
+		TransactionAPI = nullptr;
+	}
+}
+
+
+void UEdModeInteractiveToolsContext::TerminateActiveToolsOnPIEStart()
+{
+	DeactivateAllActiveTools(EToolShutdownType::Accept);
+}
+void UEdModeInteractiveToolsContext::TerminateActiveToolsOnSaveWorld()
+{
+	DeactivateAllActiveTools(EToolShutdownType::Accept);
+}
+void UEdModeInteractiveToolsContext::TerminateActiveToolsOnWorldTearDown()
+{
+	DeactivateAllActiveTools(EToolShutdownType::Cancel);
+}
+
+void UEdModeInteractiveToolsContext::PostInvalidation()
+{
+	InvalidationTimestamp++;
+}
+
+UWorld* UEdModeInteractiveToolsContext::GetWorld() const
+{
+	if (EditorModeManager)
+	{
+		return EditorModeManager->GetWorld();
+	}
+
+	return nullptr;
+}
+
+void UEdModeInteractiveToolsContext::Tick(FEditorViewportClient* ViewportClient, float DeltaTime)
+{
+	// invalidate this viewport if it's timestamp is not current
+	const int32* FoundTimestamp = InvalidationMap.Find(ViewportClient);
+	if (FoundTimestamp == nullptr)
+	{
+		ViewportClient->Invalidate(false, false);
+		InvalidationMap.Add(ViewportClient, InvalidationTimestamp);
+	}
+	if (FoundTimestamp != nullptr && *FoundTimestamp < InvalidationTimestamp)
+	{
+		ViewportClient->Invalidate(false, false);
+		InvalidationMap[ViewportClient] = InvalidationTimestamp;
+	}
+
+	// This Tick() is called for every ViewportClient, however we only want to Tick the ToolManager and GizmoManager
+	// once, for the 'Active'/Focused Viewport, so early-out here
+	if (ViewportClient != EditorModeManager->GetFocusedViewportClient())
+	{
+		return;
+	}
+
+	if ( PendingToolShutdownType )
+	{
+		UInteractiveToolsContext::EndTool(EToolSide::Mouse, *PendingToolShutdownType);
+		PendingToolShutdownType.Reset();
+	}
+	if ( PendingToolToStart )
+	{
+		if (UInteractiveToolsContext::StartTool(EToolSide::Mouse, *PendingToolToStart))
+		{
+			SetEditorStateForTool();
+		}
+		PendingToolToStart.Reset();
+	}
+
+	// Cache current camera state from this Viewport in the ContextQueries, which we will use for things like snapping/etc that
+	// is computed by the Tool and Gizmo Tick()s
+	// (This is not necessarily correct for Hover, because we might be Hovering over a different Viewport than the Active one...)
+	((FEdModeToolsContextQueriesImpl*)this->QueriesAPI)->CacheCurrentViewState(ViewportClient);
+
+	// tick our stuff
+	ToolManager->Tick(DeltaTime);
+	GizmoManager->Tick(DeltaTime);
+}
+
+
+
+class FEdModeTempRenderContext : public IToolsContextRenderAPI
+{
+public:
+	FPrimitiveDrawInterface* PDI;
+	const FSceneView* SceneView;
+	FViewCameraState ViewCameraState;
+	EViewInteractionState ViewInteractionState;
+
+	FEdModeTempRenderContext(const FSceneView* View, FViewport* Viewport, FEditorViewportClient* ViewportClient, FPrimitiveDrawInterface* DrawInterface, EViewInteractionState ViewInteractionState)
+		:PDI(DrawInterface), SceneView(View), ViewInteractionState(ViewInteractionState)
+	{
+		CacheCurrentViewState(Viewport, ViewportClient);
+	}
+
+	virtual FPrimitiveDrawInterface* GetPrimitiveDrawInterface() override
+	{
+		return PDI;
+	}
+
+	virtual const FSceneView* GetSceneView() override
+	{
+		return SceneView;
+	}
+
+	virtual FViewCameraState GetCameraState() override
+	{
+		return ViewCameraState;
+	}
+
+	virtual EViewInteractionState GetViewInteractionState() override
+	{
+		return ViewInteractionState;
+	}
+
+	void CacheCurrentViewState(FViewport* Viewport, FEditorViewportClient* ViewportClient)
+	{
+		FViewportCameraTransform ViewTransform = ViewportClient->GetViewTransform();
+		ViewCameraState.bIsOrthographic = ViewportClient->IsOrtho();
+		ViewCameraState.Position = ViewTransform.GetLocation();
+		ViewCameraState.HorizontalFOVDegrees = ViewportClient->ViewFOV;
+		ViewCameraState.AspectRatio = ViewportClient->AspectRatio;
+
+		// ViewTransform rotation is only initialized for perspective!
+		if (ViewCameraState.bIsOrthographic == false)
+		{
+			// if using Orbit camera, the rotation in the ViewTransform is not the current camera rotation, it
+			// is set to a different rotation based on the Orbit. So we have to convert back to camera rotation.
+			FRotator ViewRotation = (ViewportClient->bUsingOrbitCamera) ?
+				ViewTransform.ComputeOrbitMatrix().InverseFast().Rotator() : ViewTransform.GetRotation();
+
+			ViewCameraState.Orientation = ViewRotation.Quaternion();
+		}
+		else
+		{
+			// These rotations are based on hardcoded values in EditorViewportClient.cpp, see switches in FEditorViewportClient::CalcSceneView and FEditorViewportClient::Draw
+			switch (ViewportClient->ViewportType)
+			{
+			case LVT_OrthoXY:
+				ViewCameraState.Orientation = FQuat(FRotator(-90.0f, -90.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeXY:
+				ViewCameraState.Orientation = FQuat(FRotator(90.0f, 90.0f, 0.0f));
+				break;
+			case LVT_OrthoXZ:
+				ViewCameraState.Orientation = FQuat(FRotator(0.0f, -90.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeXZ:
+				ViewCameraState.Orientation = FQuat(FRotator(0.0f, 90.0f, 0.0f));
+				break;
+			case LVT_OrthoYZ:
+				ViewCameraState.Orientation = FQuat(FRotator(0.0f, 0.0f, 0.0f));
+				break;
+			case LVT_OrthoNegativeYZ:
+				ViewCameraState.Orientation = FQuat(FRotator(0.0f, 180.0f, 0.0f));
+				break;
+			default:
+				ViewCameraState.Orientation = FQuat::Identity;
+			}
+
+			ViewCameraState.OrthoWorldCoordinateWidth = ViewportClient->GetOrthoUnitsPerPixel(ViewportClient->Viewport) * ViewportClient->Viewport->GetSizeXY().X;
+		}
+
+		ViewCameraState.bIsVR = false;
+	}
+
+};
+
+
+void UEdModeInteractiveToolsContext::Render(const FSceneView* View, FViewport* Viewport, FPrimitiveDrawInterface* PDI)
+{
+	// tools framework cannot use HitProxy so skip these calls
+	if (PDI->IsHitTesting())
+	{
+		return;
+	}
+
+	// THIS IS NOT SAFE!! However it appears that (1) it is only possible to get certain info from the EditorViewportClient,
+	// but (2) there is no way to know if a FViewportClient is an FEditorViewportClient. Currently this ::Render() function
+	// is only intended to be called by FEdMode/UEdMode::Render(), and their ::Render() calls are only called by the
+	// FEditorViewportClient, which passes it's own Viewport down. So, this cast should be valid (for now)
+	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(Viewport->GetClient());
+
+	// Update the currently-hovered scene view information, which GizmoArrowComponent and friends will
+	// use to recalculate their size/visibility/etc.
+	if (GizmoViewContext && ViewportClient == EditorModeManager->GetHoveredViewportClient())
+	{
+		GizmoViewContext->ResetFromSceneView(*View);
+	}
+
+	// Render Tool and Gizmos
+	const FEditorViewportClient* Focused = EditorModeManager->GetFocusedViewportClient();
+	const FEditorViewportClient* Hovered = EditorModeManager->GetHoveredViewportClient();
+	EViewInteractionState InteractionState = EViewInteractionState::None;
+	if (ViewportClient == Focused )
+	{
+		InteractionState |= EViewInteractionState::Focused;
+	}
+	if (ViewportClient == Hovered )
+	{
+		InteractionState |= EViewInteractionState::Hovered;
+	}
+	FEdModeTempRenderContext RenderContext(View, Viewport, ViewportClient, PDI, InteractionState);
+	ToolManager->Render(&RenderContext);
+	GizmoManager->Render(&RenderContext);
+}
+
+void UEdModeInteractiveToolsContext::DrawHUD(FViewportClient* ViewportClient,FViewport* Viewport,const FSceneView* View, FCanvas* Canvas)
+{
+	FEditorViewportClient* EditorViewportClient = static_cast<FEditorViewportClient*>(Viewport->GetClient());
+	const FViewportClient* Focused = EditorModeManager->GetFocusedViewportClient();
+	const FViewportClient* Hovered = EditorModeManager->GetHoveredViewportClient();
+	EViewInteractionState InteractionState = EViewInteractionState::None;
+	if (ViewportClient == Focused )
+	{
+		InteractionState |= EViewInteractionState::Focused;
+	}
+	if (ViewportClient == Hovered )
+	{
+		InteractionState |= EViewInteractionState::Hovered;
+	}
+	FEdModeTempRenderContext RenderContext(View, Viewport, EditorViewportClient, nullptr /*PDI*/, InteractionState);
+	ToolManager->DrawHUD(Canvas, &RenderContext);
+	GizmoManager->DrawHUD(Canvas, &RenderContext);
+}
+
+
+bool UEdModeInteractiveToolsContext::ProcessEditDelete()
+{
+	if (ToolManager->HasAnyActiveTool() == false)
+	{
+		return false;
+	}
+
+	bool bSkipDelete = false;
+
+	USelection* SelectedActors = GEditor->GetSelectedActors();
+	for (int i = 0; i < SelectedActors->Num() && bSkipDelete == false; ++i)
+	{
+		UObject* SelectedActor = SelectedActors->GetSelectedObject(i);
+
+		// If any of the selected actors are AInternalToolFrameworkActor, we do not want to allow them to be deleted,
+		// as generally this will cause problems for the Tool.
+		if ( Cast<AInternalToolFrameworkActor>(SelectedActor) != nullptr)
+		{
+			bSkipDelete = true;
+		}
+
+		// If any Components of selected Actors implement UToolFrameworkComponent, we disable delete (for now).
+		// (Currently Sculpt and a few other Modeling Tools attach their preview mesh components to the selected Actor)
+		AActor* Actor = Cast<AActor>(SelectedActor);
+		if (Actor != nullptr)
+		{
+			const TSet<UActorComponent*>& Components = Actor->GetComponents();
+			for (const UActorComponent* Component : Components)
+			{
+				if ( Component->Implements<UToolFrameworkComponent>() )
+				{
+					bSkipDelete = true;
+				}
+			}
+		}
+
+	}
+
+	return bSkipDelete;
+}
+
+
+
+bool UEdModeInteractiveToolsContext::InputKey(FEditorViewportClient* ViewportClient, FViewport* Viewport, FKey Key, EInputEvent Event)
+{
+#ifdef ENABLE_DEBUG_PRINTING
+	if (Event == IE_Pressed) { UE_LOG(LogTemp, Warning, TEXT("PRESSED EVENT")); }
+	else if (Event == IE_Released) { UE_LOG(LogTemp, Warning, TEXT("RELEASED EVENT")); }
+	else if (Event == IE_Repeat) { UE_LOG(LogTemp, Warning, TEXT("REPEAT EVENT")); }
+	else if (Event == IE_Axis) { UE_LOG(LogTemp, Warning, TEXT("AXIS EVENT")); }
+	else if (Event == IE_DoubleClick) { UE_LOG(LogTemp, Warning, TEXT("DOUBLECLICK EVENT")); }
+#endif
+
+	if (Event == IE_Pressed || Event == IE_Released)
+	{
+		if (Key.IsMouseButton())
+		{
+			bool bIsLeftMouse = (Key == EKeys::LeftMouseButton);
+			bool bIsMiddleMouse = (Key == EKeys::MiddleMouseButton);
+			bool bIsRightMouse = (Key == EKeys::RightMouseButton);
+			if (bIsLeftMouse || bIsMiddleMouse || bIsRightMouse)
+			{
+				// Currently, we don't capture mouse clicks that start with Alt being down because we want
+				// Alt camera manipulation to have priority over tools. So, we let those inputs pass on up
+				// to wherever they get handled.
+				// Someday these kinds of prioritizations will be handled by having camera manipulation be
+				// in a common input router so that behavior priorities can determine the ordering.
+				if (ViewportClient->IsAltPressed() && InputRouter->HasActiveMouseCapture() == false)
+				{
+					return false;
+				}
+
+				FInputDeviceState InputState = CurrentMouseState;
+				InputState.InputDevice = EInputDevices::Mouse;
+				InputState.SetModifierKeyStates(
+					ViewportClient->IsShiftPressed(), ViewportClient->IsAltPressed(),
+					ViewportClient->IsCtrlPressed(), ViewportClient->IsCmdPressed());
+				if (bIsLeftMouse)
+				{
+					InputState.Mouse.Left.SetStates(
+						(Event == IE_Pressed), (Event == IE_Pressed), (Event == IE_Released));
+					CurrentMouseState.Mouse.Left.bDown = (Event == IE_Pressed);
+					CurrentMouseState.Mouse.Left.bReleased = (Event == IE_Released);
+				}
+				else if (bIsMiddleMouse)
+				{
+					InputState.Mouse.Middle.SetStates(
+						(Event == IE_Pressed), (Event == IE_Pressed), (Event == IE_Released));
+					CurrentMouseState.Mouse.Middle.bDown = (Event == IE_Pressed);
+					CurrentMouseState.Mouse.Middle.bReleased = (Event == IE_Released);
+				}
+				else
+				{
+					InputState.Mouse.Right.SetStates(
+						(Event == IE_Pressed), (Event == IE_Pressed), (Event == IE_Released));
+					CurrentMouseState.Mouse.Right.bDown = (Event == IE_Pressed);
+					CurrentMouseState.Mouse.Right.bReleased = (Event == IE_Released);
+				}
+				if (InputRouter->PostInputEvent(InputState))
+				{
+					return true;
+				}
+			}
+			else if (Key == EKeys::MouseScrollUp || Key == EKeys::MouseScrollDown)
+			{
+				// Note that we get two events for each scroll- an IE_Pressed, and IE_Released.
+				// We pass both of these in, though only the first one will have WheelDelta set.
+				// If a behavior captures the mouse wheel interaction, the second event will give
+				// it the opportunity to immediately release capture. Not passing in the second
+				// event would probably be ok too- capture would get released on next hover event.
+
+				FInputDeviceState InputState = CurrentMouseState;
+				InputState.InputDevice = EInputDevices::Mouse;
+				InputState.SetModifierKeyStates(
+					ViewportClient->IsShiftPressed(), ViewportClient->IsAltPressed(),
+					ViewportClient->IsCtrlPressed(), ViewportClient->IsCmdPressed());
+
+				InputState.Mouse.WheelDelta = (Event != IE_Pressed) ? 0
+					: (Key == EKeys::MouseScrollUp) ? 1 
+					: -1;
+
+				InputRouter->PostInputEvent(InputState);
+			}
+		}
+		else if (Key.IsGamepadKey())
+		{
+			// not supported yet
+		}
+		else if (Key.IsTouch())
+		{
+			// not supported yet
+		}
+		else if (Key.IsAnalog())
+		{
+			// not supported yet
+		}
+		else    // is this definitely a keyboard key?
+		{
+			FInputDeviceState InputState;
+			InputState.InputDevice = EInputDevices::Keyboard;
+			InputState.SetModifierKeyStates(
+				ViewportClient->IsShiftPressed(), ViewportClient->IsAltPressed(),
+				ViewportClient->IsCtrlPressed(), ViewportClient->IsCmdPressed());
+			InputState.Keyboard.ActiveKey.Button = Key;
+			bool bPressed = (Event == IE_Pressed);
+			InputState.Keyboard.ActiveKey.SetStates(bPressed, bPressed, !bPressed);
+			return InputRouter->PostInputEvent(InputState);
+		}
+	}
+
+	return false;
+}
+
+bool UEdModeInteractiveToolsContext::MouseEnter(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 x, int32 y)
+{
+#ifdef ENABLE_DEBUG_PRINTING
+	UE_LOG(LogTemp, Warning, TEXT("MOUSE ENTER"));
+#endif
+
+	CurrentMouseState.Mouse.Position2D = FVector2D(x, y);
+	CurrentMouseState.Mouse.WorldRay = GetRayFromMousePos(ViewportClient, Viewport, x, y);
+
+	return false;
+}
+
+
+bool UEdModeInteractiveToolsContext::MouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 x, int32 y)
+{
+#ifdef ENABLE_DEBUG_PRINTING
+	UE_LOG(LogTemp, Warning, TEXT("HOVER %p"), ViewportClient);
+#endif
+
+	CurrentMouseState.Mouse.Position2D = FVector2D(x, y);
+	CurrentMouseState.Mouse.WorldRay = GetRayFromMousePos(ViewportClient, Viewport, x, y);
+	FInputDeviceState InputState = CurrentMouseState;
+	InputState.InputDevice = EInputDevices::Mouse;
+
+	InputState.SetModifierKeyStates(
+		ViewportClient->IsShiftPressed(), ViewportClient->IsAltPressed(),
+		ViewportClient->IsCtrlPressed(), ViewportClient->IsCmdPressed());
+
+	if (InputRouter->HasActiveMouseCapture())
+	{
+		// TODO: This should no longer be necessary: test and remove.
+		// This state occurs if InputBehavior did not release capture on mouse release.
+		// UMultiClickSequenceInputBehavior does this, eg for multi-click draw-polygon sequences.
+		// It's not ideal though and maybe would be better done via multiple captures + hover...?
+		InputRouter->PostInputEvent(InputState);
+	}
+	else
+	{
+		InputRouter->PostHoverInputEvent(InputState);
+	}
+
+	return false;
+}
+
+
+bool UEdModeInteractiveToolsContext::MouseLeave(FEditorViewportClient* ViewportClient, FViewport* Viewport)
+{
+#ifdef ENABLE_DEBUG_PRINTING
+	UE_LOG(LogTemp, Warning, TEXT("MOUSE LEAVE"));
+#endif
+
+	return false;
+}
+
+
+
+bool UEdModeInteractiveToolsContext::StartTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
+{
+	bIsTrackingMouse = InputRouter->HasActiveMouseCapture();
+	return bIsTrackingMouse;
+}
+
+bool UEdModeInteractiveToolsContext::CapturedMouseMove(FEditorViewportClient* InViewportClient, FViewport* InViewport, int32 InMouseX, int32 InMouseY)
+{
+	FVector2D OldPosition = CurrentMouseState.Mouse.Position2D;
+	CurrentMouseState.Mouse.Position2D = FVector2D(InMouseX, InMouseY);
+	CurrentMouseState.Mouse.WorldRay = GetRayFromMousePos(InViewportClient, InViewport, InMouseX, InMouseY);
+
+	if (InputRouter->HasActiveMouseCapture())
+	{
+#ifdef ENABLE_DEBUG_PRINTING
+		UE_LOG(LogTemp, Warning, TEXT("CAPTURED MOUSE MOVE"));
+#endif
+
+		FInputDeviceState InputState = CurrentMouseState;
+		InputState.InputDevice = EInputDevices::Mouse;
+		InputState.SetModifierKeyStates(
+			InViewportClient->IsShiftPressed(), InViewportClient->IsAltPressed(),
+			InViewportClient->IsCtrlPressed(), InViewportClient->IsCmdPressed());
+		InputState.Mouse.Delta2D = CurrentMouseState.Mouse.Position2D - OldPosition;
+		InputRouter->PostInputEvent(InputState);
+		return true;
+	}
+
+	return false;
+}
+
+bool UEdModeInteractiveToolsContext::EndTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
+{
+	if (bIsTrackingMouse)
+	{
+		// If the input router captured the mouse input, we need to invalidate the viewport client here, since the mouse delta tracker's end tracking will not be called.
+		constexpr bool bForceChildViewportRedraw = true;
+		constexpr bool bInvalidateHitProxies = true;
+		InViewportClient->Invalidate(bForceChildViewportRedraw, bInvalidateHitProxies);
+		bIsTrackingMouse = false;
+		return true;
+	}
+
+	return false;
+}
+
+FRay UEdModeInteractiveToolsContext::GetRayFromMousePos(FEditorViewportClient* ViewportClient, FViewport* Viewport, int MouseX, int MouseY)
+{
+	FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
+		ViewportClient->Viewport,
+		ViewportClient->GetScene(),
+		ViewportClient->EngineShowFlags).SetRealtimeUpdate(ViewportClient->IsRealtime()));		// why SetRealtimeUpdate here??
+	// this View is deleted by the FSceneViewFamilyContext destructor
+	FSceneView* View = ViewportClient->CalcSceneView(&ViewFamily);
+	FViewportCursorLocation MouseViewportRay(View, ViewportClient, MouseX, MouseY);
+
+	FVector RayOrigin = MouseViewportRay.GetOrigin();
+	FVector RayDirection = MouseViewportRay.GetDirection();
+
+	// in Ortho views, the RayOrigin appears to be completely arbitrary, in some views it is on the view plane,
+	// others it moves back/forth with the OrthoZoom. Translate by a large amount here in hopes of getting
+	// ray origin "outside" the scene (which is a disaster for numerical precision !! ... )
+	if (ViewportClient->IsOrtho())
+	{
+		RayOrigin -= 0.1 * HALF_WORLD_MAX * RayDirection;
+	}
+
+	return FRay(RayOrigin, RayDirection, true);
+}
+
+FRay UEdModeInteractiveToolsContext::GetLastWorldRay() const
+{
+	return CurrentMouseState.Mouse.WorldRay;
+}
+
+bool UEdModeInteractiveToolsContext::CanStartTool(const FString ToolTypeIdentifier) const
+{
+	return UInteractiveToolsContext::CanStartTool(EToolSide::Mouse, ToolTypeIdentifier);
+}
+
+bool UEdModeInteractiveToolsContext::HasActiveTool() const
+{
+	return UInteractiveToolsContext::HasActiveTool(EToolSide::Mouse);
+}
+
+FString UEdModeInteractiveToolsContext::GetActiveToolName() const
+{
+	return UInteractiveToolsContext::GetActiveToolName(EToolSide::Mouse);
+}
+
+bool UEdModeInteractiveToolsContext::ActiveToolHasAccept() const
+{
+	return  UInteractiveToolsContext::ActiveToolHasAccept(EToolSide::Mouse);
+}
+
+bool UEdModeInteractiveToolsContext::CanAcceptActiveTool() const
+{
+	return UInteractiveToolsContext::CanAcceptActiveTool(EToolSide::Mouse);
+}
+
+bool UEdModeInteractiveToolsContext::CanCancelActiveTool() const
+{
+	return UInteractiveToolsContext::CanCancelActiveTool(EToolSide::Mouse);
+}
+
+bool UEdModeInteractiveToolsContext::CanCompleteActiveTool() const
+{
+	return UInteractiveToolsContext::CanCompleteActiveTool(EToolSide::Mouse);
+}
+
+void UEdModeInteractiveToolsContext::StartTool(const FString ToolTypeIdentifier)
+{
+	FString LocalIdentifier(ToolTypeIdentifier);
+	PendingToolToStart = LocalIdentifier;
+	PostInvalidation();
+}
+
+void UEdModeInteractiveToolsContext::EndTool(EToolShutdownType ShutdownType)
+{
+	PendingToolShutdownType = ShutdownType;
+	PostInvalidation();
+}
+
+
+
+void UEdModeInteractiveToolsContext::DeactivateActiveTool(EToolSide WhichSide, EToolShutdownType ShutdownType)
+{
+	UInteractiveToolsContext::DeactivateActiveTool(WhichSide, ShutdownType);
+	RestoreEditorState();
+}
+
+void UEdModeInteractiveToolsContext::DeactivateAllActiveTools(EToolShutdownType ShutdownType)
+{
+	UInteractiveToolsContext::DeactivateAllActiveTools(ShutdownType);
+	RestoreEditorState();
+}
+
+void UEdModeInteractiveToolsContext::SetEditorStateForTool()
+{
+	FLevelEditorModule& LevelEditorModule = FModuleManager::GetModuleChecked<FLevelEditorModule>("LevelEditor");
+	TSharedPtr<ILevelEditor> LevelEditor = LevelEditorModule.GetFirstLevelEditor();
+	if (LevelEditor.IsValid())
+	{
+		TArray<TSharedPtr<SLevelViewport>> Viewports = LevelEditor->GetViewports();
+		for (const TSharedPtr<SLevelViewport>& ViewportWindow : Viewports)
+		{
+			if (ViewportWindow.IsValid())
+			{
+				FEditorViewportClient& Viewport = ViewportWindow->GetAssetViewportClient();
+				Viewport.EnableOverrideEngineShowFlags([](FEngineShowFlags& Flags)
+				{
+					Flags.SetTemporalAA(false);
+					Flags.SetMotionBlur(false);
+					// disable this as depending on fixed exposure settings the entire scene may turn black
+					//Flags.SetEyeAdaptation(false);
+				});
+			}
+		}
+	}
+}
+
+void UEdModeInteractiveToolsContext::RestoreEditorState()
+{
+	FLevelEditorModule& LevelEditorModule = FModuleManager::GetModuleChecked<FLevelEditorModule>("LevelEditor");
+	TSharedPtr<ILevelEditor> LevelEditor  = LevelEditorModule.GetFirstLevelEditor();
+	if (LevelEditor.IsValid())
+	{
+		TArray<TSharedPtr<SLevelViewport>> Viewports = LevelEditor->GetViewports();
+		for (const TSharedPtr<SLevelViewport>& ViewportWindow : Viewports)
+		{
+			if (ViewportWindow.IsValid())
+			{
+				FEditorViewportClient& Viewport = ViewportWindow->GetAssetViewportClient();
+				Viewport.DisableOverrideEngineShowFlags();
+			}
+		}
+	}
+}
+
+void UEdModeInteractiveToolsContext::OnToolEnded(UInteractiveToolManager* InToolManager, UInteractiveTool* InEndedTool)
+{
+	RestoreEditorState();
+}
+
+void UEdModeInteractiveToolsContext::OnToolPostBuild(UInteractiveToolManager* InToolManager, EToolSide InSide, UInteractiveTool* InBuiltTool, UInteractiveToolBuilder* InToolBuilder, const FToolBuilderState& ToolState)
+{
+	// todo: Add any shared tool targets for the mode toolkit
+}
