@@ -1,0 +1,18 @@
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = false
+	logallrefupdates = true
+	symlinks = false
+	ignorecase = true
+[submodule]
+	active = .
+[remote "origin"]
+	url = https://freetreeman@github.com/EpicGames/UnrealEngine.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "release"]
+	remote = origin
+	merge = refs/heads/release
+[branch "ue5-main"]
+	remote = origin
+	merge = refs/heads/ue5-main
